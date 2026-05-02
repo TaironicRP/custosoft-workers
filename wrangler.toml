@@ -1,0 +1,46 @@
+name = "custosoft-api"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# ── Workers AI / Runtime ────────────────────────────────────────────────────
+[placement]
+mode = "smart"   # Latency-optimised placement
+
+# ── D1 Database ─────────────────────────────────────────────────────────────
+[[d1_databases]]
+binding  = "DB"
+database_name = "custosoft-db"
+database_id   = "f86079bc-db52-482a-87cf-dabef3cd3e0d"
+
+# ── R2 Buckets ───────────────────────────────────────────────────────────────
+[[r2_buckets]]
+binding     = "UPLOADS"
+bucket_name = "custosoft-uploads"
+
+# ── Environment Variables (non-secret) ──────────────────────────────────────
+[vars]
+APP_ENV         = "production"
+PUBLIC_BASE_URL = "https://api.custosoft.de"
+FROM_EMAIL      = "noreply@custosoftcustomers.com"
+FROM_NAME       = "CustoSoft"
+# CORS: allow requests from the app (and web if needed)
+ALLOWED_ORIGINS = "https://custosoft.de,capacitor://localhost,http://localhost"
+
+# ── Secrets (set via: wrangler secret put SECRET_NAME) ─────────────────────
+# JWT_SECRET              — 64+ char random string
+# APPLE_CLIENT_ID         — com.taironic.custosoft
+# APPLE_TEAM_ID           — your Apple Team ID
+# APPLE_KEY_ID            — Sign In with Apple key ID
+# APPLE_PRIVATE_KEY       — p8 private key (single line, \n escaped)
+# APPLE_IAP_SHARED_SECRET — App Store Connect shared secret
+# MAILCHANNELS_API_KEY    — optional (MailChannels needs DKIM setup)
+
+# ── Routes (after custom domain is set up) ──────────────────────────────────
+# [[routes]]
+# pattern = "api.custosoft.de/*"
+# zone_name = "custosoft.de"
+
+# ── Local Dev (wrangler dev) ─────────────────────────────────────────────────
+[dev]
+port = 8787
