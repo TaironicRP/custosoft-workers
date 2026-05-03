@@ -30,20 +30,27 @@ function buildLinkDto(row: any): Record<string, any> {
 
 function buildApplicationDto(row: any) {
   return {
-    id: row.id,
-    linkId: row.link_id ?? row.linkId,
-    orgId: row.org_id ?? row.orgId,
-    firstName: row.first_name ?? row.firstName,
-    lastName: row.last_name ?? row.lastName,
-    email: row.email,
-    phone: row.phone ?? null,
-    coverLetter: row.cover_letter ?? row.coverLetter ?? null,
-    status: row.status,
-    internalNotes: row.internal_notes ?? row.internalNotes ?? null,
+    id:               row.id,
+    linkId:           row.link_id           ?? row.linkId           ?? null,
+    linkTitle:        row.link_title         ?? row.linkTitle         ?? null,
+    orgId:            row.org_id             ?? row.orgId,
+    firstName:        row.first_name         ?? row.firstName,
+    lastName:         row.last_name          ?? row.lastName,
+    email:            row.email,
+    phone:            row.phone              ?? null,
+    coverLetter:      row.cover_letter       ?? row.coverLetter      ?? null,
+    status:           row.status,
+    internalNotes:    row.internal_notes     ?? row.internalNotes    ?? null,
     assignedToUserId: row.assigned_to_user_id ?? row.assignedToUserId ?? null,
-    attachmentUrl: row.attachment_url ?? row.attachmentUrl ?? null,
-    submittedAt: row.submitted_at ?? row.submittedAt,
-    updatedAt: row.last_updated_at ?? row.updated_at ?? row.updatedAt ?? null,
+    assignedToName:   row.assigned_to_name   ?? row.assignedToName   ?? null,
+    applicantUserId:  row.applicant_user_id  ?? row.applicantUserId  ?? null,
+    submittedAt:      row.submitted_at       ?? row.submittedAt,
+    firstViewedAt:    row.first_viewed_at    ?? row.firstViewedAt    ?? null,
+    lastUpdatedAt:    row.last_updated_at    ?? row.updated_at       ?? row.updatedAt ?? null,
+    // iOS JobApplication.attachments: [JobApplicationAttachment] is non-optional;
+    // attachment uploads are separate, so we always send an empty array here.
+    // The detail endpoint can enrich this if needed.
+    attachments:      [],
   }
 }
 
@@ -168,7 +175,7 @@ recruitment.put('/links/:id', requireAuth, async (c) => {
   const id = c.req.param('id')
 
   const orgMember = await db
-    .prepare(`SELECT org_id, role FROM org_members WHERE user_id = ? LIMIT 1`)
+    .prepare(`SELECT org_id, role FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1`)
     .bind(user.id)
     .first<{ org_id: string; role: string }>()
 
@@ -244,7 +251,7 @@ recruitment.delete('/links/:id', requireAuth, async (c) => {
   const id = c.req.param('id')
 
   const orgMember = await db
-    .prepare(`SELECT org_id, role FROM org_members WHERE user_id = ? LIMIT 1`)
+    .prepare(`SELECT org_id, role FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1`)
     .bind(user.id)
     .first<{ org_id: string; role: string }>()
 
@@ -280,7 +287,7 @@ recruitment.get('/applications', requireAuth, async (c) => {
   const status = c.req.query('status')
 
   const orgMember = await db
-    .prepare(`SELECT org_id FROM org_members WHERE user_id = ? LIMIT 1`)
+    .prepare(`SELECT org_id FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1`)
     .bind(user.id)
     .first<{ org_id: string }>()
 
@@ -319,7 +326,7 @@ recruitment.get('/applications/:id', requireAuth, async (c) => {
   const id = c.req.param('id')
 
   const orgMember = await db
-    .prepare(`SELECT org_id FROM org_members WHERE user_id = ? LIMIT 1`)
+    .prepare(`SELECT org_id FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1`)
     .bind(user.id)
     .first<{ org_id: string }>()
 
@@ -350,7 +357,7 @@ recruitment.put('/applications/:id', requireAuth, async (c) => {
   const id = c.req.param('id')
 
   const orgMember = await db
-    .prepare(`SELECT org_id, role FROM org_members WHERE user_id = ? LIMIT 1`)
+    .prepare(`SELECT org_id, role FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1`)
     .bind(user.id)
     .first<{ org_id: string; role: string }>()
 
