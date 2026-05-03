@@ -347,15 +347,45 @@ CREATE TABLE IF NOT EXISTS managed_grants (
 -- Seed Data: Products
 -- ═══════════════════════════════════════════════════════════════════════════
 
-INSERT OR IGNORE INTO products (slug, name, description, price_formatted, is_active, is_subscription, trial_days, billing_period_days, apple_product_id)
+-- Aktueller Katalog (App Store Launch). Trial-Tage = 0 — Frontend-Flag
+-- FeatureFlags.trialsEnabled aktiviert UI sobald hier wieder Trials gesetzt sind.
+INSERT OR IGNORE INTO products
+  (slug, name, description, price_formatted, is_active, is_subscription,
+   trial_days, billing_period_days, base_price, is_slot_based,
+   starting_slots, max_slots, apple_product_id)
 VALUES
-  ('GroupChat',    'Gruppen-Chat',      'Team-Gruppen erstellen, Direktnachrichten, Dateianhänge', '1,99 €/2 Wochen', 1, 1, 14, 14, 'de.custosoft.app.groupchat'),
-  ('PunchClock',   'Stempeluhr',        'Zeiterfassung mit Pause & Statistiken. Orgs: Team-Übersicht.', '1,99 €/2 Wochen', 1, 1, 14, 14, 'de.custosoft.app.punchclock'),
-  ('FileSystem',   'Akten-System',      'Digitale Mitarbeiterakten, Dokumente & Notizen.', '2,99 €/Monat', 1, 1, 14, 30, 'de.custosoft.app.filesystem'),
-  ('Business',     'Business-Paket',    'Team-Stempeluhr & Verwaltung — Slot-basiert.', '49,00 €/Monat', 1, 1, 0, 30, 'de.custosoft.app.business'),
-  ('MoreSpace',    'Mehr Platz',        'Erweiterte iPad- und Mac-Ansicht.', '9,99 €', 1, 0, 0, NULL, 'de.custosoft.app.morespace'),
-  ('Recruitment',  'Bewerbungsmanager', 'Stellen-Links erstellen, Bewerbungen sammeln.', '14,99 €', 1, 0, 0, NULL, 'de.custosoft.app.recruitment'),
-  ('TerminalMode', 'Wand-Stempeluhr',   'iPad an die Wand: alle Mitarbeiter stempeln per PIN.', '14,99 €', 1, 0, 0, NULL, 'de.custosoft.app.terminalmode');
+  ('PunchClock',          'Stempeluhr',
+   'Zeiterfassung für eine Person — wöchentliches Abo, jederzeit kündbar.',
+   '2,99 €/Woche',   1, 1, 0,   7,   2.99, 0, 1,  1,
+   'de.custosoft.app.punchclock'),
+  ('BusinessBasic',       'Business Basic',
+   '10 Mitarbeiter-Slots · Stempeluhr · Akten · Chat',
+   '49,00 €/Monat',  1, 1, 0,  30,  49.00, 0, 10, 10,
+   'de.custosoft.app.business.basic.monthly'),
+  ('BusinessBasicYearly', 'Business Basic Jährlich',
+   '10 Slots · 20 % Rabatt im Jahresabo',
+   '469,00 €/Jahr',  1, 1, 0, 365, 469.00, 0, 10, 10,
+   'de.custosoft.app.business.basic.yearly'),
+  ('BusinessL',           'Business L',
+   '50 Mitarbeiter-Slots · alle Team-Features inkl. Bewerbungsmanagement',
+   '89,00 €/Monat',  1, 1, 0,  30,  89.00, 0, 50, 50,
+   'de.custosoft.app.business.l.monthly'),
+  ('BusinessLYearly',     'Business L Jährlich',
+   '50 Slots · 20 % Rabatt im Jahresabo',
+   '849,00 €/Jahr',  1, 1, 0, 365, 849.00, 0, 50, 50,
+   'de.custosoft.app.business.l.yearly'),
+  ('MoreSpace',           'Mehr Platz',
+   'Erweiterte iPad- und Mac-Ansicht. Einmaliger Kauf.',
+   '4,99 €',         1, 0, 0, NULL,  4.99, 0, 1,  1,
+   'de.custosoft.app.morespace'),
+  ('Recruitment',         'Bewerbungsmanager',
+   'Stellen-Links erstellen, Bewerbungen sammeln, Workflow steuern.',
+   '9,99 €',         1, 0, 0, NULL,  9.99, 0, 1,  1,
+   'de.custosoft.app.recruitment'),
+  ('TerminalMode',        'Wand-Stempeluhr',
+   'iPad an die Wand: alle Mitarbeiter stempeln per PIN.',
+   '14,99 €',        1, 0, 0, NULL, 14.99, 0, 1,  1,
+   'de.custosoft.app.terminalmode');
 
 -- Seed Data: Legal Pages
 INSERT OR IGNORE INTO legal_pages (slug, title, content)

@@ -264,15 +264,14 @@ const ADMIN_HTML = `<!DOCTYPE html>
       <div class="modal-header"><h3>🎁 Lizenz vergeben</h3><button class="close" onclick="closeGrantModal()">×</button></div>
       <div class="field"><label>Nutzer-E-Mail</label><input type="email" id="grantEmail" placeholder="user@example.com"></div>
       <div class="field"><label>Produkt</label><select id="grantProduct">
-        <option value="PunchClock">Stempeluhr (2,99 €/2 Wochen)</option>
-        <option value="Recruitment">Bewerbungsmanager (16,99 €)</option>
-        <option value="TerminalMode">Wand-Stempeluhr (9,99 €)</option>
+        <option value="PunchClock">Stempeluhr (2,99 €/Woche)</option>
+        <option value="MoreSpace">Mehr Platz (4,99 €)</option>
+        <option value="Recruitment">Bewerbungsmanager (9,99 €)</option>
+        <option value="TerminalMode">Wand-Stempeluhr (14,99 €)</option>
         <option value="BusinessBasic">Business Basic (49 €/Monat · 10 Slots)</option>
         <option value="BusinessBasicYearly">Business Basic Jährlich (469 €/Jahr · 10 Slots)</option>
         <option value="BusinessL">Business L (89 €/Monat · 50 Slots)</option>
         <option value="BusinessLYearly">Business L Jährlich (849 €/Jahr · 50 Slots)</option>
-        <option value="BusinessMAX">Business MAX (149 €/Monat · unbegrenzt)</option>
-        <option value="BusinessMAXYearly">Business MAX Jährlich (1.429 €/Jahr · unbegrenzt)</option>
       </select></div>
       <button class="btn-primary" onclick="grantLicense()">Vergeben</button>
     </div>
