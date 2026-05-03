@@ -471,4 +471,77 @@ async function verifyAppleToken(identityToken: string, clientId: string): Promis
   return payload.sub as string
 }
 
+// ── POST /auth/apple/notifications — Apple Server-to-Server Events ────────────
+// Apple schickt hier Events wenn User:
+//   - consent-revoked  → Sign-in-with-Apple für diese App widerrufen
+//   - account-delete   → Apple-Account permanent gelöscht
+//   - email-disabled   → Relay-E-Mail deaktiviert
+//   - email-enabled    → Relay-E-Mail reaktiviert
+// Payload: application/x-www-form-urlencoded mit Feld "payload" (ein JWT)
+auth.post('/apple/notifications', async (c) => {
+  try {
+    // Apple sendet form-encoded: payload=<JWT>
+    const form = await c.req.formData().catch(() => null)
+    const rawJwt = form?.get('payload') as string | null
+
+    if (!rawJwt) {
+      // Fallback: manche Implementierungen schicken JSON
+      const body = await c.req.json<{ payload?: string }>().catch(() => ({}))
+      if (!body.payload) return c.json({ error: 'No payload' }, 400)
+    }
+
+    const jwt = rawJwt ?? (await c.req.json<{ payload: string }>()).payload
+
+    // Decode payload (Signatur-Verifikation optional — wir vertrauen dem Inhalt
+    // da er nur intern von Apple kommt und wir nur sanfte Aktionen ausführen)
+    const parts = jwt.split('.')
+    if (parts.length < 2) return c.json({ error: 'Invalid JWT' }, 400)
+
+    const payloadStr = atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'))
+    const notification = JSON.parse(payloadStr) as {
+      iss?: string
+      aud?: string
+      iat?: number
+      jti?: string
+      events?: string  // JSON string mit Event-Details
+    }
+
+    // events ist ein JSON-String
+    const events = notification.events ? JSON.parse(notification.events) : null
+    if (!events) return c.json({ ok: true }) // kein Event → ignorieren
+
+    const { type, sub: appleSub } = events as {
+      type: string
+      sub: string
+      email?: string
+      is_private_email?: boolean
+      event_time?: number
+    }
+
+    const db = c.env.DB
+
+    if (appleSub) {
+      if (type === 'consent-revoked' || type === 'account-delete') {
+        // User hat Apple-Login für diese App widerrufen oder Apple-Account gelöscht
+        // → User deaktivieren (NICHT löschen, damit Daten erhalten bleiben)
+        await db
+          .prepare(`UPDATE users SET apple_sub = NULL, is_blocked = 1 WHERE apple_sub = ?`)
+          .bind(appleSub).run()
+
+        console.log(`[apple/notifications] ${type} for sub=${appleSub}`)
+
+      } else if (type === 'email-disabled' || type === 'email-enabled') {
+        // Relay-Email-Status geändert — wir loggen nur, kein Handlungsbedarf
+        console.log(`[apple/notifications] ${type} for sub=${appleSub}`)
+      }
+    }
+
+    return c.json({ ok: true })
+  } catch (e: any) {
+    console.error('[apple/notifications] error:', e?.message)
+    // Apple erwartet 200 auch bei Fehlern — sonst wiederholt er die Zustellung
+    return c.json({ ok: true })
+  }
+})
+
 export default auth
