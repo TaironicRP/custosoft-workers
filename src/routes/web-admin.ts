@@ -148,6 +148,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
         <a data-tab="orders">💳 <span>Bestellungen</span></a>
         <a data-tab="notifications">🔔 <span>Benachrichtigungen</span></a>
         <a data-tab="legal">📜 <span>Rechtstexte</span></a>
+        <a data-tab="staff">🛡️ <span>Staff &amp; SuperAdmin</span></a>
       </nav>
       <div class="logout"><a id="logoutBtn">🚪 <span>Abmelden</span></a></div>
     </aside>
@@ -238,6 +239,19 @@ const ADMIN_HTML = `<!DOCTYPE html>
         <div id="legalList" style="display:flex;flex-direction:column;gap:12px;margin-top:16px"></div>
       </section>
 
+      <!-- STAFF & SUPERADMIN -->
+      <section data-section="staff" style="display:none">
+        <h2>Staff &amp; SuperAdmin <span class="count" id="staffCount"></span></h2>
+        <p class="sub">Verwaltung der internen Mitarbeiter mit Backend-Zugriff. Promotion erfordert Master-Key.</p>
+        <div class="toolbar">
+          <button class="btn ok" onclick="openPromoteModal()">+ Neuen SuperAdmin/Staff erstellen</button>
+        </div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Name</th><th>E-Mail</th><th>Rolle</th><th>Registriert</th><th>Letzter Login</th><th></th></tr></thead>
+          <tbody id="staffBody"></tbody>
+        </table></div>
+      </section>
+
     </main>
   </div>
 
@@ -250,13 +264,15 @@ const ADMIN_HTML = `<!DOCTYPE html>
       <div class="modal-header"><h3>🎁 Lizenz vergeben</h3><button class="close" onclick="closeGrantModal()">×</button></div>
       <div class="field"><label>Nutzer-E-Mail</label><input type="email" id="grantEmail" placeholder="user@example.com"></div>
       <div class="field"><label>Produkt</label><select id="grantProduct">
-        <option value="GroupChat">Gruppen-Chat</option>
-        <option value="PunchClock">Stempeluhr</option>
-        <option value="FileSystem">Akten-System</option>
-        <option value="Business">Business-Paket</option>
-        <option value="MoreSpace">Mehr Platz</option>
-        <option value="Recruitment">Bewerbungsmanager</option>
-        <option value="TerminalMode">Wand-Stempeluhr</option>
+        <option value="PunchClock">Stempeluhr (2,99 €/2 Wochen)</option>
+        <option value="Recruitment">Bewerbungsmanager (16,99 €)</option>
+        <option value="TerminalMode">Wand-Stempeluhr (9,99 €)</option>
+        <option value="BusinessBasic">Business Basic (49 €/Monat · 10 Slots)</option>
+        <option value="BusinessBasicYearly">Business Basic Jährlich (469 €/Jahr · 10 Slots)</option>
+        <option value="BusinessL">Business L (89 €/Monat · 50 Slots)</option>
+        <option value="BusinessLYearly">Business L Jährlich (849 €/Jahr · 50 Slots)</option>
+        <option value="BusinessMAX">Business MAX (149 €/Monat · unbegrenzt)</option>
+        <option value="BusinessMAXYearly">Business MAX Jährlich (1.429 €/Jahr · unbegrenzt)</option>
       </select></div>
       <button class="btn-primary" onclick="grantLicense()">Vergeben</button>
     </div>
@@ -269,6 +285,23 @@ const ADMIN_HTML = `<!DOCTYPE html>
       <div class="field"><label>Titel</label><input type="text" id="legalEditTitleInput"></div>
       <div class="field"><label>Inhalt (HTML erlaubt)</label><textarea id="legalEditContent" rows="20" style="font-family:'SF Mono',Menlo,monospace;font-size:13px"></textarea></div>
       <button class="btn-primary" onclick="saveLegal()">Speichern</button>
+    </div>
+  </div>
+
+  <!-- PROMOTE TO SUPERADMIN MODAL -->
+  <div id="promoteModal" class="modal-backdrop">
+    <div class="modal" style="max-width: 520px">
+      <div class="modal-header"><h3>🛡️ SuperAdmin / Staff erstellen</h3><button class="close" onclick="closePromoteModal()">×</button></div>
+      <div style="background:rgba(255,170,60,0.10);border:1px solid rgba(255,170,60,0.30);border-radius:12px;padding:14px;margin-bottom:18px;font-size:12px;color:rgba(255,255,255,0.75)">
+        ⚠️ Diese Aktion gibt jemandem <strong>vollen Backend-Zugriff</strong>. Nur an Personen erteilen, die auch wirklich Staff sind. Master-Key wird benötigt.
+      </div>
+      <div class="field"><label>Nutzer-E-Mail (muss bereits registriert sein)</label><input type="email" id="promoteEmail" placeholder="user@example.com"></div>
+      <div class="field"><label>Rolle</label><select id="promoteRole">
+        <option value="SuperAdmin">SuperAdmin (alle Rechte)</option>
+        <option value="Staff">Staff (Standard)</option>
+      </select></div>
+      <div class="field"><label>Master-Key</label><input type="password" id="promoteKey" placeholder="••••" autocomplete="off"></div>
+      <button class="btn-primary" onclick="promoteSuperAdmin()">Befördern</button>
     </div>
   </div>
 
@@ -371,8 +404,70 @@ document.querySelectorAll('.sidebar nav a').forEach(a => {
     else if (tab === 'orders')   loadOrders()
     else if (tab === 'notifications') loadNotifications()
     else if (tab === 'legal')    loadLegal()
+    else if (tab === 'staff')    loadStaff()
   })
 })
+
+// ── Staff & SuperAdmin ──────────────────────────────────────────────
+async function loadStaff() {
+  document.getElementById('staffBody').innerHTML = '<tr><td colspan="6" class="loading">Lade…</td></tr>'
+  try {
+    const r = await api('/admin/staff-list')
+    const items = r.items || []
+    document.getElementById('staffCount').textContent = '(' + items.length + ')'
+    const tb = document.getElementById('staffBody')
+    if (!items.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">Keine Staff vorhanden</td></tr>'; return }
+    tb.innerHTML = items.map(s => {
+      const roleClass = s.role === 'SuperAdmin' ? 'staff' : 'priv'
+      return '<tr><td><strong>' + escHtml(s.displayName) + '</strong></td>' +
+        '<td style="color:rgba(255,255,255,0.65);font-size:13px">' + escHtml(s.email) + '</td>' +
+        '<td><span class="pill ' + roleClass + '">' + escHtml(s.role) + '</span></td>' +
+        '<td style="font-size:12px">' + fmtDate(s.registeredAt) + '</td>' +
+        '<td style="font-size:12px">' + (s.lastLoginAt ? fmtDateTime(s.lastLoginAt) : '–') + '</td>' +
+        '<td>' + (s.id !== me.id ? '<button class="btn danger" onclick="demoteSuperAdmin(\\''+ s.id +'\\')">Entfernen</button>' : '<span style="color:rgba(255,255,255,0.30);font-size:11px">Du selbst</span>') + '</td></tr>'
+    }).join('')
+  } catch (e) { document.getElementById('staffBody').innerHTML = '<tr><td colspan="6" class="empty">' + escHtml(e.message) + '</td></tr>' }
+}
+
+function openPromoteModal() {
+  document.getElementById('promoteEmail').value = ''
+  document.getElementById('promoteKey').value = ''
+  document.getElementById('promoteRole').value = 'SuperAdmin'
+  document.getElementById('promoteModal').classList.add('show')
+}
+function closePromoteModal() { document.getElementById('promoteModal').classList.remove('show') }
+document.getElementById('promoteModal').addEventListener('click', e => { if (e.target.id === 'promoteModal') closePromoteModal() })
+
+async function promoteSuperAdmin() {
+  const userEmail = document.getElementById('promoteEmail').value.trim()
+  const role      = document.getElementById('promoteRole').value
+  const masterKey = document.getElementById('promoteKey').value
+  if (!userEmail || !masterKey) { toast('Email + Master-Key sind Pflicht'); return }
+  try {
+    const r = await api('/admin/promote-superadmin', {
+      method: 'POST',
+      body: JSON.stringify({ userEmail, role, masterKey })
+    })
+    toast(r.email + ' ist jetzt ' + r.newRole)
+    closePromoteModal()
+    loadStaff()
+  } catch (e) {
+    toast('Fehler: ' + e.message)
+  }
+}
+
+async function demoteSuperAdmin(userId) {
+  const masterKey = prompt('Master-Key eingeben um SuperAdmin-Rechte zu entziehen:')
+  if (!masterKey) return
+  try {
+    await api('/admin/demote-superadmin', {
+      method: 'POST',
+      body: JSON.stringify({ userId, masterKey })
+    })
+    toast('Rechte entzogen')
+    loadStaff()
+  } catch (e) { toast('Fehler: ' + e.message) }
+}
 
 // ── Overview ────────────────────────────────────────────────
 async function loadOverview() {

@@ -177,59 +177,122 @@ auth.post('/apple', async (c) => {
 })
 
 // ── POST /forgot ──────────────────────────────────────────────────────────────
+// Generiert einen 6-stelligen numerischen Code, speichert ihn in
+// password_reset_tokens (das Token-Feld nimmt den Code) und sendet per Email.
+// Der iOS-Client zeigt eine Code-Eingabe (6 Ziffern) an.
 auth.post('/forgot', async (c) => {
-  const { email } = await c.req.json<{ email: string }>()
-  // Always return 200 (anti-enumeration)
-  const user = await c.env.DB
-    .prepare('SELECT * FROM users WHERE email_normalized = ?')
-    .bind((email ?? '').trim().toUpperCase()).first<any>()
+  try {
+    const { email } = await c.req.json<{ email?: string }>().catch(() => ({}))
+    const cleanEmail = (email ?? '').trim()
+    if (!cleanEmail) return c.json({ error: 'Email erforderlich.' }, 400)
 
-  if (user) {
-    const token   = randomToken()
-    const expires = new Date(Date.now() + 3600_000).toISOString()
-    await c.env.DB
-      .prepare('INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES (?, ?, ?)')
-      .bind(user.id, token, expires).run()
+    // Always return 200 (anti-enumeration) — egal ob User existiert oder nicht
+    const user = await c.env.DB
+      .prepare('SELECT * FROM users WHERE email_normalized = ?')
+      .bind(cleanEmail.toUpperCase()).first<any>()
 
-    const resetUrl = `${c.env.PUBLIC_BASE_URL}/reset-password?token=${token}`
-    const name     = `${user.first_name} ${user.last_name}`.trim() || user.email
-    await sendEmail({
-      to: user.email, toName: name,
-      subject: 'Passwort zurücksetzen',
-      text: passwordResetText(resetUrl, name),
-      html: passwordResetHtml(resetUrl, name),
-      from: c.env.FROM_EMAIL, fromName: c.env.FROM_NAME,
-      apiKey: c.env.RESEND_API_KEY,
-    })
+    if (user) {
+      // 6-stelliger Code: 100000-999999
+      const code = String(Math.floor(100000 + Math.random() * 900000))
+      const expires = new Date(Date.now() + 30 * 60_000).toISOString()  // 30 Min gültig
+
+      // Alte ungenutzte Codes für diesen User invalidieren (nur ein aktiver Code)
+      await c.env.DB
+        .prepare('UPDATE password_reset_tokens SET used = 1 WHERE user_id = ? AND used = 0')
+        .bind(user.id).run()
+
+      await c.env.DB
+        .prepare('INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES (?, ?, ?)')
+        .bind(user.id, code, expires).run()
+
+      const name = `${user.first_name ?? ''} ${user.last_name ?? ''}`.trim() || user.email
+      const subject = 'Dein Passwort-Reset-Code'
+      const text = `Hallo${name ? ' ' + name : ''},
+
+Hier ist dein Code zum Zurücksetzen deines Passworts:
+
+  ${code}
+
+Gib diesen Code in der CustoSoft-App ein um ein neues Passwort zu setzen.
+Der Code ist 30 Minuten gültig. Wenn du diesen Code nicht angefordert hast, ignoriere diese E-Mail.
+
+— Dein CustoSoft Team`
+
+      const html = `<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><style>
+        body{margin:0;padding:0;background:#0a0a14;font-family:-apple-system,sans-serif;color:#fff}
+        .wrap{max-width:540px;margin:40px auto;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.10);border-radius:24px;overflow:hidden}
+        .hero{background:linear-gradient(135deg,#7733ff,#3399ff);padding:36px 32px;text-align:center}
+        .hero h1{font-size:22px;font-weight:700;margin:0 0 6px;color:#fff}
+        .hero p{color:rgba(255,255,255,0.85);margin:0;font-size:13px}
+        .body{padding:30px 32px;color:rgba(255,255,255,0.80);line-height:1.55}
+        .code-box{background:rgba(119,51,255,0.18);border:1px solid rgba(119,51,255,0.45);border-radius:14px;padding:24px;text-align:center;font-size:36px;font-weight:700;letter-spacing:10px;color:#a98cff;font-family:'SF Mono',monospace;margin:18px 0}
+        .footer{padding:18px;border-top:1px solid rgba(255,255,255,0.07);text-align:center;color:rgba(255,255,255,0.30);font-size:11px}
+      </style></head><body><div class="wrap">
+        <div class="hero"><h1>🔐 Passwort zurücksetzen</h1><p>Dein 6-stelliger Code</p></div>
+        <div class="body">
+          <p>Hallo${name ? ' ' + name : ''},</p>
+          <p>Gib diesen Code in der CustoSoft-App ein um dein Passwort zurückzusetzen:</p>
+          <div class="code-box">${code}</div>
+          <p style="font-size:12px;color:rgba(255,255,255,0.55);margin-top:16px">Der Code ist <strong>30 Minuten</strong> gültig. Wenn du diesen Reset nicht angefordert hast, ignoriere diese E-Mail — dein Passwort bleibt unverändert.</p>
+        </div>
+        <div class="footer">CustoSoft · <a href="https://custosoftcustomers.com/datenschutz" style="color:rgba(255,255,255,0.50)">Datenschutz</a></div>
+      </div></body></html>`
+
+      const sent = await sendEmail({
+        to: user.email, toName: name,
+        subject, text, html,
+        from: c.env.FROM_EMAIL, fromName: c.env.FROM_NAME,
+        apiKey: c.env.RESEND_API_KEY,
+      })
+      if (!sent) {
+        console.error('[POST /auth/forgot] sendEmail returned false for', user.email,
+                      '— RESEND_API_KEY/FROM_EMAIL/PUBLIC_BASE_URL korrekt gesetzt?')
+        // Wir geben trotzdem 200 zurück (anti-enumeration), aber loggen den Fail
+      } else {
+        console.log('[POST /auth/forgot] Code an', user.email, 'gesendet')
+      }
+    }
+
+    return c.json({ ok: true })
+  } catch (e: any) {
+    console.error('[POST /auth/forgot]', e?.message ?? e)
+    // Anti-enumeration: kein 500 raus
+    return c.json({ ok: true })
   }
-
-  return c.json({ ok: true })
 })
 
 // ── POST /reset ───────────────────────────────────────────────────────────────
+// Body: { token: "123456", newPassword: "..." }  — token = der 6-stellige Code
 auth.post('/reset', async (c) => {
-  const { token, newPassword } = await c.req.json<{ token: string; newPassword: string }>()
-  if (!token || !newPassword)
-    return c.json({ error: 'Token und Passwort erforderlich.' }, 400)
-  if (newPassword.length < 8)
-    return c.json({ error: 'Passwort muss mindestens 8 Zeichen lang sein.' }, 400)
+  try {
+    const body = await c.req.json<{ token?: string; code?: string; newPassword?: string }>().catch(() => ({}))
+    const code = (body.token ?? body.code ?? '').trim()
+    const newPassword = body.newPassword ?? ''
+    if (!code || !newPassword)
+      return c.json({ error: 'Code und Passwort erforderlich.' }, 400)
+    if (newPassword.length < 8)
+      return c.json({ error: 'Passwort muss mindestens 8 Zeichen lang sein.' }, 400)
 
-  const now = new Date().toISOString()
-  const row = await c.env.DB
-    .prepare('SELECT * FROM password_reset_tokens WHERE token = ? AND used = 0 AND expires_at > ?')
-    .bind(token, now).first<any>()
+    const now = new Date().toISOString()
+    const row = await c.env.DB
+      .prepare('SELECT * FROM password_reset_tokens WHERE token = ? AND used = 0 AND expires_at > ?')
+      .bind(code, now).first<any>()
 
-  if (!row) return c.json({ error: 'Ungültiger oder abgelaufener Reset-Link.' }, 400)
+    if (!row) return c.json({ error: 'Ungültiger oder abgelaufener Code.' }, 400)
 
-  const hash = await hashPassword(newPassword)
-  await c.env.DB
-    .prepare('UPDATE users SET password_hash = ? WHERE id = ?')
-    .bind(hash, row.user_id).run()
-  await c.env.DB
-    .prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ?')
-    .bind(row.id).run()
+    const hash = await hashPassword(newPassword)
+    await c.env.DB
+      .prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+      .bind(hash, row.user_id).run()
+    await c.env.DB
+      .prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ?')
+      .bind(row.id).run()
 
-  return c.json({ ok: true })
+    return c.json({ ok: true })
+  } catch (e: any) {
+    console.error('[POST /auth/reset]', e?.message ?? e)
+    return c.json({ error: `Reset fehlgeschlagen: ${e?.message ?? 'unbekannt'}` }, 500)
+  }
 })
 
 // ── POST /verify-email ────────────────────────────────────────────────────────
@@ -284,6 +347,27 @@ auth.post('/resend-verification', requireAuth, async (c) => {
 auth.get('/me', requireAuth, async (c) => {
   const user = c.get('userRow') as any
   return c.json(await buildUserDto(c.env.DB, user))
+})
+
+// ── PUT /me — Account-Type ändern (Privat ↔ Organisation) ────────────────────
+auth.put('/me', requireAuth, async (c) => {
+  const userId = c.get('userId') as string
+  const body   = await c.req.json<{ accountType?: string }>()
+
+  if (body.accountType && !['Private', 'Organisation'].includes(body.accountType)) {
+    return c.json({ error: 'accountType muss "Private" oder "Organisation" sein.' }, 400)
+  }
+
+  if (body.accountType) {
+    await c.env.DB
+      .prepare(`UPDATE users SET account_type = ? WHERE id = ?`)
+      .bind(body.accountType, userId).run()
+  }
+
+  const u = await c.env.DB.prepare(`SELECT * FROM users WHERE id = ?`).bind(userId).first<any>()
+  if (!u) return c.json({ error: 'Nutzer nicht gefunden.' }, 404)
+
+  return c.json(await buildUserDto(c.env.DB, u))
 })
 
 // ── PUT /me/username ──────────────────────────────────────────────────────────

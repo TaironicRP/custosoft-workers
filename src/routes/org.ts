@@ -3,6 +3,46 @@ import { Hono }        from 'hono'
 import type { Env, AppEnv } from '../types'
 import { requireAuth } from '../middleware/auth'
 import { randomInviteCode } from '../utils/crypto'
+import { sendEmail }   from '../utils/email'
+
+// ── Slot-System: max Mitglieder je Lizenz-Tier ───────────────────────────────
+// Owner-Lizenz bestimmt die Slots der Org. Ohne Business-Lizenz: max 1 (Owner allein).
+function maxMembersForBusinessSlug(slug: string | null | undefined): number {
+  if (!slug) return 1
+  if (slug === 'BusinessBasic' || slug === 'BusinessBasicYearly') return 10
+  if (slug === 'BusinessL'     || slug === 'BusinessLYearly')     return 50
+  if (slug === 'BusinessMAX'   || slug === 'BusinessMAXYearly')   return 9999
+  if (slug === 'Business')                                         return 10  // Legacy
+  if (slug === 'AllInOne'      || slug === 'AllInOneYearly')      return 9999 // Legacy
+  return 1
+}
+
+/** Gibt das Member-Limit der Org zurück (basierend auf Owner-Lizenz). */
+async function getOrgMemberLimit(db: D1Database, orgId: number): Promise<{ limit: number; current: number; ownerSlug: string | null }> {
+  const org = await db.prepare(`SELECT owner_id FROM organisations WHERE id = ?`).bind(orgId).first<{ owner_id: string }>()
+  if (!org) return { limit: 1, current: 0, ownerSlug: null }
+
+  const ownerExt = await db
+    .prepare(`SELECT product FROM user_extensions
+              WHERE user_id = ? AND is_active = 1
+                AND product IN ('BusinessBasic','BusinessBasicYearly','BusinessL','BusinessLYearly','BusinessMAX','BusinessMAXYearly','Business','AllInOne','AllInOneYearly')
+                AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+              ORDER BY
+                CASE product
+                  WHEN 'BusinessMAX' THEN 1 WHEN 'BusinessMAXYearly' THEN 1 WHEN 'AllInOne' THEN 1 WHEN 'AllInOneYearly' THEN 1
+                  WHEN 'BusinessL'   THEN 2 WHEN 'BusinessLYearly'   THEN 2
+                  WHEN 'BusinessBasic' THEN 3 WHEN 'BusinessBasicYearly' THEN 3 WHEN 'Business' THEN 3
+                  ELSE 9 END
+              LIMIT 1`)
+    .bind(org.owner_id).first<{ product: string }>()
+
+  const limit = maxMembersForBusinessSlug(ownerExt?.product)
+
+  const cur = await db.prepare(`SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND is_active = 1`)
+    .bind(orgId).first<{ n: number }>()
+
+  return { limit, current: cur?.n ?? 0, ownerSlug: ownerExt?.product ?? null }
+}
 
 const org = new Hono<AppEnv>()
 
@@ -29,12 +69,38 @@ org.get('/', requireAuth, async (c) => {
     .prepare('SELECT COUNT(*) as n FROM org_members WHERE org_id = ? AND is_active = 1')
     .bind(o.id).first<{ n: number }>()
 
+  // Slot-Info (current vs limit)
+  const slots = await getOrgMemberLimit(c.env.DB, o.id)
+
   return c.json({
     id: o.id, name: o.name, ownerId: o.owner_id, logoUrl: o.logo_url,
     activeExtensions: exts.results.map(r => r.product),
     memberCount: memberCount?.n ?? 0,
+    memberLimit: slots.limit,
+    ownerLicenseSlug: slots.ownerSlug,
     createdAt: o.created_at,
   })
+})
+
+// ── DELETE /org — Organisation komplett auflösen (nur Owner) ─────────────────
+org.delete('/', requireAuth, async (c) => {
+  const userId = c.get('userId') as string
+  const member = await c.env.DB
+    .prepare("SELECT * FROM org_members WHERE user_id = ? AND is_active = 1 AND role = 'Owner' LIMIT 1")
+    .bind(userId).first<any>()
+  if (!member) return c.json({ error: 'Nur der Owner kann die Organisation auflösen.' }, 403)
+
+  // Alle Akten archivieren
+  await c.env.DB
+    .prepare("UPDATE employee_files SET is_archived = 1, archived_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE org_id = ?")
+    .bind(member.org_id).run()
+
+  // Cascade-Delete via Schema-Constraints (organisations → ON DELETE CASCADE)
+  await c.env.DB
+    .prepare("DELETE FROM organisations WHERE id = ?")
+    .bind(member.org_id).run()
+
+  return new Response(null, { status: 204 })
 })
 
 // ── PUT /org — update org name/logo ──────────────────────────────────────────
@@ -70,7 +136,7 @@ org.get('/members', requireAuth, async (c) => {
               ORDER BY om.role ASC, om.joined_at ASC`)
     .bind(member.org_id).all<any>()
 
-  return c.json(members.results.map(m => ({
+  const items = (members.results ?? []).map(m => ({
     id: m.id, userId: m.user_id, email: m.email,
     displayName: `${m.first_name} ${m.last_name}`.trim() || m.email,
     avatarUrl: m.avatar_url, orgRole: m.role, joinedAt: m.joined_at,
@@ -88,24 +154,36 @@ org.get('/members', requireAuth, async (c) => {
       canUseRecruitment:         m.can_use_recruitment === 1,
       canManageRecruitment:      m.can_manage_recruitment === 1,
     },
-  })))
+  }))
+
+  // PaginatedResponse-Shape (iOS erwartet items, totalCount, page, pageSize)
+  return c.json({
+    items,
+    totalCount: items.length,
+    page: 1,
+    pageSize: items.length,
+  })
 })
 
-// ── POST /org/invite — invite by email ───────────────────────────────────────
+// ── POST /org/invite — Einladung per E-Mail mit auto-generiertem Code ────────
 org.post('/invite', requireAuth, async (c) => {
   const userId = c.get('userId') as string
+  const userRow = c.get('userRow') as any
   const member = await c.env.DB
-    .prepare("SELECT * FROM org_members WHERE user_id = ? AND is_active = 1 AND (role = 'Owner' OR can_manage_members = 1) LIMIT 1")
+    .prepare("SELECT * FROM org_members WHERE user_id = ? AND is_active = 1 AND (role = 'Owner' OR role = 'Admin' OR can_manage_members = 1) LIMIT 1")
     .bind(userId).first<any>()
   if (!member) return c.json({ error: 'Keine Berechtigung.' }, 403)
 
-  const { email } = await c.req.json<{ email: string; message?: string }>()
-  if (!email) return c.json({ error: 'E-Mail erforderlich.' }, 400)
+  const { email, message } = await c.req.json<{ email: string; message?: string }>()
+  if (!email?.trim()) return c.json({ error: 'E-Mail erforderlich.' }, 400)
 
-  // Check if already member
+  const cleanEmail = email.trim().toLowerCase()
+  const upperEmail = cleanEmail.toUpperCase()
+
+  // Bereits Mitglied?
   const target = await c.env.DB
     .prepare('SELECT id FROM users WHERE email_normalized = ?')
-    .bind(email.trim().toUpperCase()).first<any>()
+    .bind(upperEmail).first<any>()
 
   if (target) {
     const alreadyMember = await c.env.DB
@@ -115,9 +193,96 @@ org.post('/invite', requireAuth, async (c) => {
       return c.json({ error: 'Diese Person ist bereits in deiner Organisation.' }, 409)
   }
 
-  // For now: create a pending invite code and email it
-  // TODO: implement pending_invites table for full invite flow
-  return c.json({ ok: true, message: 'Einladung wird gesendet.' })
+  // ── SLOT-CHECK ──────────────────────────────────────────────────────
+  const slots = await getOrgMemberLimit(c.env.DB, member.org_id)
+  if (slots.current >= slots.limit) {
+    return c.json({
+      error: `Deine Organisation ist voll (${slots.current}/${slots.limit} Mitglieder). Buche Business L oder MAX um mehr Mitglieder einzuladen.`
+    }, 409)
+  }
+
+  // Org-Daten für Email
+  const org = await c.env.DB
+    .prepare('SELECT name FROM organisations WHERE id = ?')
+    .bind(member.org_id).first<{ name: string }>()
+  if (!org) return c.json({ error: 'Org nicht gefunden.' }, 500)
+
+  // Personalisierten Invite-Code erstellen (gültig 7 Tage, max 1 Verwendung)
+  const codeChars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  const codeBytes = crypto.getRandomValues(new Uint8Array(8))
+  const code = Array.from(codeBytes).map(b => codeChars[b % codeChars.length]).join('')
+
+  const expiresAt = new Date(Date.now() + 7 * 86400_000).toISOString()
+  const inviterName = `${userRow.first_name ?? ''} ${userRow.last_name ?? ''}`.trim() || userRow.email
+
+  await c.env.DB
+    .prepare(`INSERT INTO org_invite_codes (org_id, code, created_by_id, created_by_name, expires_at, max_uses)
+              VALUES (?, ?, ?, ?, ?, 1)`)
+    .bind(member.org_id, code, userId, inviterName, expiresAt).run()
+
+  // Email senden
+  const subject = `${inviterName} lädt dich zu ${org.name} ein`
+  const text = `Hallo!
+
+${inviterName} hat dich zu ${org.name} bei CustoSoft eingeladen.
+
+Dein persönlicher Einladungs-Code: ${code}
+
+So trittst du bei:
+1. CustoSoft App laden (App Store)
+2. Account erstellen (oder einloggen)
+3. Tippe auf "Organisation beitreten"
+4. Code eingeben: ${code}
+
+${message ? `Persönliche Nachricht:\n"${message}"\n\n` : ''}Der Code ist 7 Tage gültig.
+
+— Dein CustoSoft Team`
+
+  const html = `<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><style>
+    body{margin:0;padding:0;background:#0a0a14;font-family:-apple-system,sans-serif}
+    .wrap{max-width:540px;margin:40px auto;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.10);border-radius:24px;overflow:hidden}
+    .hero{background:linear-gradient(135deg,#3366ff,#1144cc);padding:40px 32px;text-align:center}
+    .hero h1{color:#fff;font-size:24px;font-weight:700;margin:0 0 6px}
+    .hero p{color:rgba(255,255,255,0.85);margin:0;font-size:14px}
+    .body{padding:32px;color:rgba(255,255,255,0.80)}
+    .code-box{background:rgba(51,102,255,0.20);border:1px solid rgba(51,102,255,0.50);border-radius:14px;padding:24px;text-align:center;font-size:32px;font-weight:700;letter-spacing:8px;color:#7790ff;font-family:'SF Mono',monospace;margin:18px 0}
+    .steps{background:rgba(255,255,255,0.05);border-radius:12px;padding:18px;margin-top:14px}
+    .footer{padding:18px;border-top:1px solid rgba(255,255,255,0.07);text-align:center;color:rgba(255,255,255,0.30);font-size:11px}
+  </style></head><body><div class="wrap">
+    <div class="hero"><h1>👋 Du bist eingeladen!</h1><p>${inviterName} → ${org.name}</p></div>
+    <div class="body">
+      <p>Hallo,</p>
+      <p><strong>${inviterName}</strong> hat dich zu <strong>${org.name}</strong> bei CustoSoft eingeladen.</p>
+      <p style="font-size:13px;color:rgba(255,255,255,0.55)">Dein persönlicher Einladungs-Code:</p>
+      <div class="code-box">${code}</div>
+      ${message ? `<p style="background:rgba(255,255,255,0.06);padding:14px;border-radius:10px;font-style:italic;color:rgba(255,255,255,0.75)">"${message}"<br><span style="font-size:11px;color:rgba(255,255,255,0.45);font-style:normal">— ${inviterName}</span></p>` : ''}
+      <div class="steps">
+        <p style="font-weight:600;margin-bottom:10px">So trittst du bei:</p>
+        <p style="margin:4px 0">1. <a href="https://apps.apple.com/de/app/custosoft" style="color:#7790ff;text-decoration:none">CustoSoft App</a> laden</p>
+        <p style="margin:4px 0">2. Account erstellen oder einloggen</p>
+        <p style="margin:4px 0">3. „Organisation beitreten" tippen</p>
+        <p style="margin:4px 0">4. Code eingeben: <strong>${code}</strong></p>
+      </div>
+      <p style="font-size:12px;color:rgba(255,255,255,0.45);margin-top:18px">Der Code ist 7 Tage gültig (bis ${new Date(expiresAt).toLocaleDateString('de-DE')}).</p>
+    </div>
+    <div class="footer">CustoSoft · <a href="https://custosoftcustomers.com/datenschutz" style="color:rgba(255,255,255,0.50)">Datenschutz</a></div>
+  </div></body></html>`
+
+  const sent = await sendEmail({
+    to: cleanEmail,
+    subject,
+    text,
+    html,
+    from: c.env.FROM_EMAIL,
+    fromName: c.env.FROM_NAME,
+    apiKey: c.env.RESEND_API_KEY,
+  })
+
+  if (!sent) {
+    return c.json({ error: 'Einladungs-Mail konnte nicht gesendet werden.' }, 500)
+  }
+
+  return c.json({ ok: true, code, expiresAt })
 })
 
 // ── GET /org/invite-codes ─────────────────────────────────────────────────────
@@ -126,17 +291,19 @@ org.get('/invite-codes', requireAuth, async (c) => {
   const member = await c.env.DB
     .prepare('SELECT * FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1')
     .bind(userId).first<any>()
-  if (!member) return c.json([], 200)
+  if (!member) return c.json({ items: [], totalCount: 0, page: 1, pageSize: 100 })
 
   const codes = await c.env.DB
     .prepare('SELECT * FROM org_invite_codes WHERE org_id = ? ORDER BY created_at DESC')
     .bind(member.org_id).all<any>()
 
-  return c.json(codes.results.map(c => ({
+  const items = (codes.results ?? []).map(c => ({
     id: c.id, code: c.code, createdByName: c.created_by_name,
     createdAt: c.created_at, expiresAt: c.expires_at,
     usedCount: c.used_count, maxUses: c.max_uses,
-  })))
+  }))
+
+  return c.json({ items, totalCount: items.length, page: 1, pageSize: items.length })
 })
 
 // ── POST /org/invite-codes — create new code ──────────────────────────────────
@@ -182,39 +349,131 @@ org.delete('/invite-codes/:id', requireAuth, async (c) => {
   return new Response(null, { status: 204 })
 })
 
-// ── POST /org/join — join by invite code ──────────────────────────────────────
-org.post('/join', requireAuth, async (c) => {
-  const userId = c.get('userId') as string
-  const { code } = await c.req.json<{ code: string }>()
+// ── GET /org/preview-code?code=XXX — Vorschau OHNE Beitritt (für Confirmation-Popup) ──
+org.get('/preview-code', requireAuth, async (c) => {
+  const code = (c.req.query('code') ?? '').trim().toUpperCase()
   if (!code) return c.json({ error: 'Code erforderlich.' }, 400)
 
-  const now  = new Date().toISOString()
-  const inv  = await c.env.DB
-    .prepare('SELECT * FROM org_invite_codes WHERE code = ? AND (expires_at IS NULL OR expires_at > ?) AND (max_uses IS NULL OR used_count < max_uses)')
-    .bind(code.trim().toUpperCase(), now).first<any>()
-  if (!inv) return c.json({ error: 'Ungültiger oder abgelaufener Einladungs-Code.' }, 400)
+  const now = new Date().toISOString()
+  const inv = await c.env.DB
+    .prepare(`SELECT * FROM org_invite_codes
+              WHERE code = ?
+                AND (expires_at IS NULL OR expires_at > ?)
+                AND (max_uses IS NULL OR used_count < max_uses)`)
+    .bind(code, now).first<any>()
+  if (!inv) return c.json({ error: 'Ungültiger oder abgelaufener Einladungs-Code.' }, 404)
 
-  // Check not already member
-  const existing = await c.env.DB
-    .prepare('SELECT id FROM org_members WHERE user_id = ? AND org_id = ?')
-    .bind(userId, inv.org_id).first()
-  if (existing) return c.json({ error: 'Du bist bereits in dieser Organisation.' }, 409)
+  const org = await c.env.DB
+    .prepare('SELECT * FROM organisations WHERE id = ?')
+    .bind(inv.org_id).first<any>()
+  if (!org) return c.json({ error: 'Organisation nicht gefunden.' }, 404)
 
-  // Check if in another org
-  const otherMember = await c.env.DB
-    .prepare('SELECT id FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1')
-    .bind(userId).first()
-  if (otherMember) return c.json({ error: 'Du bist bereits in einer anderen Organisation.' }, 409)
+  // Owner-Daten für Anzeige
+  const owner = await c.env.DB
+    .prepare(`SELECT first_name, last_name, email FROM users WHERE id = ?`)
+    .bind(org.owner_id).first<any>()
+  const ownerName = owner
+    ? (`${owner.first_name ?? ''} ${owner.last_name ?? ''}`.trim() || owner.email)
+    : 'Unbekannt'
 
-  await c.env.DB
-    .prepare('INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)')
-    .bind(inv.org_id, userId, 'Member').run()
+  const memberRow = await c.env.DB
+    .prepare('SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND is_active = 1')
+    .bind(org.id).first<{ n: number }>()
 
-  await c.env.DB
-    .prepare('UPDATE org_invite_codes SET used_count = used_count + 1 WHERE id = ?')
-    .bind(inv.id).run()
+  return c.json({
+    orgId:       org.id,
+    orgName:     org.name,
+    ownerName,
+    memberCount: memberRow?.n ?? 1,
+    expiresAt:   inv.expires_at,
+  })
+})
 
-  return c.json({ ok: true })
+// ── POST /org/join — join by invite code (returns Organisation) ────────────────
+org.post('/join', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as string
+    const { code } = await c.req.json<{ code: string }>()
+    if (!code) return c.json({ error: 'Code erforderlich.' }, 400)
+
+    const now  = new Date().toISOString()
+    const inv  = await c.env.DB
+      .prepare('SELECT * FROM org_invite_codes WHERE code = ? AND (expires_at IS NULL OR expires_at > ?) AND (max_uses IS NULL OR used_count < max_uses)')
+      .bind(code.trim().toUpperCase(), now).first<any>()
+    if (!inv) return c.json({ error: 'Ungültiger oder abgelaufener Einladungs-Code.' }, 400)
+
+    // Check not already an ACTIVE member of THIS org (inactive rows = previously left → reactivate, not block)
+    const activeExisting = await c.env.DB
+      .prepare('SELECT id FROM org_members WHERE user_id = ? AND org_id = ? AND is_active = 1')
+      .bind(userId, inv.org_id).first()
+    if (activeExisting) return c.json({ error: 'Du bist bereits in dieser Organisation.' }, 409)
+
+    // Check if in another ACTIVE org
+    const otherMember = await c.env.DB
+      .prepare('SELECT id FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1')
+      .bind(userId).first()
+    if (otherMember) return c.json({ error: 'Du bist bereits in einer anderen Organisation.' }, 409)
+
+    // ── SLOT-CHECK ────────────────────────────────────────────────────────
+    const slots = await getOrgMemberLimit(c.env.DB, inv.org_id)
+    if (slots.current >= slots.limit) {
+      return c.json({
+        error: `Diese Organisation ist voll (${slots.current}/${slots.limit} Mitglieder). Der Inhaber muss ein größeres Paket buchen.`
+      }, 409)
+    }
+
+    // Reaktivieren wenn alte inaktive Mitgliedschaft existiert, sonst neu anlegen
+    const inactiveRow = await c.env.DB
+      .prepare('SELECT id FROM org_members WHERE user_id = ? AND org_id = ? AND is_active = 0')
+      .bind(userId, inv.org_id).first<{ id: number }>()
+    if (inactiveRow) {
+      await c.env.DB
+        .prepare(`UPDATE org_members
+                  SET is_active = 1,
+                      role = 'Member',
+                      joined_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                  WHERE id = ?`)
+        .bind(inactiveRow.id).run()
+    } else {
+      await c.env.DB
+        .prepare(`INSERT INTO org_members (org_id, user_id, role, is_active, can_create_groups, can_invite_to_chats, can_use_recruitment)
+                  VALUES (?, ?, 'Member', 1, 1, 1, 1)`)
+        .bind(inv.org_id, userId).run()
+    }
+
+    // Archivierte Akten wieder aktivieren falls vorhanden
+    await c.env.DB
+      .prepare(`UPDATE employee_files SET is_archived = 0, archived_at = NULL
+                WHERE subject_user_id = ? AND org_id = ? AND is_archived = 1`)
+      .bind(userId, inv.org_id).run()
+
+    await c.env.DB
+      .prepare('UPDATE org_invite_codes SET used_count = used_count + 1 WHERE id = ?')
+      .bind(inv.id).run()
+
+    // Org-Object zurückgeben (matches iOS Organisation struct)
+    const org = await c.env.DB
+      .prepare('SELECT * FROM organisations WHERE id = ?')
+      .bind(inv.org_id).first<any>()
+    if (!org) return c.json({ error: 'Org nicht gefunden.' }, 500)
+
+    const memberRow = await c.env.DB
+      .prepare('SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND is_active = 1')
+      .bind(org.id).first<{ n: number }>()
+
+    return c.json({
+      id:               org.id,
+      name:             org.name,
+      ownerId:          org.owner_id,
+      logoUrl:          org.logo_url,
+      activeExtensions: [],
+      memberCount:      memberRow?.n ?? 1,
+      createdAt:        org.created_at,
+    })
+  } catch (e: any) {
+    console.error('[POST /org/join] failed:', e?.message ?? e, e?.stack)
+    return c.json({ error: `Beitritt fehlgeschlagen: ${e?.message ?? 'unbekannt'}` }, 500)
+  }
 })
 
 // ── POST /org/leave ───────────────────────────────────────────────────────────
@@ -229,6 +488,14 @@ org.post('/leave', requireAuth, async (c) => {
   // Archive employee files instead of deleting
   await c.env.DB
     .prepare("UPDATE employee_files SET is_archived = 1, archived_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE subject_user_id = ? AND org_id = ?")
+    .bind(userId, member.org_id).run()
+
+  // SICHERHEIT: Aus allen Org-Conversations entfernen damit der User keine
+  // Org-Chats mehr sieht nach dem Verlassen
+  await c.env.DB
+    .prepare(`DELETE FROM conversation_members
+              WHERE user_id = ? AND conversation_id IN
+                (SELECT id FROM conversations WHERE org_id = ?)`)
     .bind(userId, member.org_id).run()
 
   await c.env.DB
@@ -252,6 +519,13 @@ org.delete('/members/:uid', requireAuth, async (c) => {
     .prepare("UPDATE employee_files SET is_archived = 1, archived_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE subject_user_id = ? AND org_id = ?")
     .bind(targetId, myMember.org_id).run()
 
+  // SICHERHEIT: Aus allen Org-Conversations entfernen
+  await c.env.DB
+    .prepare(`DELETE FROM conversation_members
+              WHERE user_id = ? AND conversation_id IN
+                (SELECT id FROM conversations WHERE org_id = ?)`)
+    .bind(targetId, myMember.org_id).run()
+
   await c.env.DB
     .prepare('UPDATE org_members SET is_active = 0 WHERE user_id = ? AND org_id = ?')
     .bind(targetId, myMember.org_id).run()
@@ -260,52 +534,136 @@ org.delete('/members/:uid', requireAuth, async (c) => {
 })
 
 // ── PUT /org/members/:id/role ─────────────────────────────────────────────────
+// Owner ändert Rolle eines Mitglieds. Returns updated OrgMember.
 org.put('/members/:id/role', requireAuth, async (c) => {
-  const userId = c.get('userId') as string
-  const myMember = await c.env.DB
-    .prepare("SELECT * FROM org_members WHERE user_id = ? AND is_active = 1 AND role = 'Owner' LIMIT 1")
-    .bind(userId).first<any>()
-  if (!myMember) return c.json({ error: 'Nur Owner kann Rollen vergeben.' }, 403)
+  try {
+    const userId = c.get('userId') as string
+    const myMember = await c.env.DB
+      .prepare("SELECT * FROM org_members WHERE user_id = ? AND is_active = 1 AND role = 'Owner' LIMIT 1")
+      .bind(userId).first<any>()
+    if (!myMember) return c.json({ error: 'Nur Owner kann Rollen vergeben.' }, 403)
 
-  const { role } = await c.req.json<{ role: string }>()
-  if (!['Admin', 'Member'].includes(role))
-    return c.json({ error: 'Ungültige Rolle.' }, 400)
+    const { role } = await c.req.json<{ role: string }>().catch(() => ({ role: '' }))
+    if (!['Admin', 'Member'].includes(role)) {
+      return c.json({ error: 'Ungültige Rolle.' }, 400)
+    }
 
-  await c.env.DB
-    .prepare('UPDATE org_members SET role = ? WHERE id = ? AND org_id = ?')
-    .bind(role, c.req.param('id'), myMember.org_id).run()
+    const memberId = c.req.param('id')
+    await c.env.DB
+      .prepare('UPDATE org_members SET role = ? WHERE id = ? AND org_id = ?')
+      .bind(role, memberId, myMember.org_id).run()
 
-  return c.json({ ok: true })
+    const m = await c.env.DB
+      .prepare(`SELECT om.*, u.email, u.first_name, u.last_name, u.avatar_url
+                FROM org_members om
+                JOIN users u ON u.id = om.user_id
+                WHERE om.id = ? AND om.org_id = ?`)
+      .bind(memberId, myMember.org_id).first<any>()
+    if (!m) return c.json({ error: 'Mitglied nicht gefunden.' }, 404)
+
+    return c.json({
+      id:          m.id,
+      userId:      m.user_id,
+      email:       m.email,
+      displayName: (`${m.first_name ?? ''} ${m.last_name ?? ''}`.trim()) || m.email,
+      avatarUrl:   m.avatar_url,
+      orgRole:     m.role,
+      joinedAt:    m.joined_at,
+      isActive:    m.is_active === 1,
+      permissions: {
+        canManageMembers:          m.can_manage_members === 1,
+        canManageInviteCodes:      m.can_manage_invite_codes === 1,
+        canCreateGroups:           m.can_create_groups === 1,
+        canManageFiles:            m.can_manage_files === 1,
+        canInviteToChats:          m.can_invite_to_chats === 1,
+        canUseMoreSpace:           m.can_use_more_space === 1,
+        canViewSalaries:           m.can_view_salaries === 1,
+        canManageEmployeeProfiles: m.can_manage_employee_profiles === 1,
+        canManageOrgStructure:     m.can_manage_org_structure === 1,
+        canUseRecruitment:         m.can_use_recruitment === 1,
+        canManageRecruitment:      m.can_manage_recruitment === 1,
+      },
+    })
+  } catch (e: any) {
+    console.error('[PUT /org/members/:id/role]', e?.message ?? e)
+    return c.json({ error: `Rolle konnte nicht gespeichert werden: ${e?.message ?? 'unbekannt'}` }, 500)
+  }
 })
 
 // ── PUT /org/members/:id/permissions ─────────────────────────────────────────
+// iOS sendet { permissions: { canManageMembers, canCreateGroups, ... } } und
+// erwartet das aktualisierte OrgMember-Objekt zurück.
 org.put('/members/:id/permissions', requireAuth, async (c) => {
-  const userId = c.get('userId') as string
-  const myMember = await c.env.DB
-    .prepare("SELECT * FROM org_members WHERE user_id = ? AND is_active = 1 AND role = 'Owner' LIMIT 1")
-    .bind(userId).first<any>()
-  if (!myMember) return c.json({ error: 'Nur Owner kann Berechtigungen ändern.' }, 403)
+  try {
+    const userId = c.get('userId') as string
+    const myMember = await c.env.DB
+      .prepare("SELECT * FROM org_members WHERE user_id = ? AND is_active = 1 AND role = 'Owner' LIMIT 1")
+      .bind(userId).first<any>()
+    if (!myMember) return c.json({ error: 'Nur Owner kann Berechtigungen ändern.' }, 403)
 
-  const p = await c.req.json<Record<string, boolean>>()
-  const fields = [
-    'can_manage_members','can_manage_invite_codes','can_create_groups','can_manage_files',
-    'can_invite_to_chats','can_use_more_space','can_view_salaries',
-    'can_manage_employee_profiles','can_manage_org_structure','can_use_recruitment','can_manage_recruitment'
-  ]
+    // Body kann entweder { permissions: {...} } (iOS) ODER flat {...} sein
+    const raw = await c.req.json<any>().catch(() => ({}))
+    const p: Record<string, boolean> = (raw?.permissions ?? raw) ?? {}
 
-  // Convert camelCase keys to snake_case
-  const toSnake = (s: string) => s.replace(/[A-Z]/g, l => `_${l.toLowerCase()}`)
-  const sets = fields.map(f => `${f} = ?`).join(', ')
-  const vals = fields.map(f => {
-    const key = f.split('_').map((w,i) => i === 0 ? w : w[0].toUpperCase() + w.slice(1)).join('')
-    return p[key] ? 1 : 0
-  })
+    // camelCase → snake_case Feld-Mapping (das iOS sendet camelCase Keys)
+    const fieldMap: Array<[string, string]> = [
+      ['canManageMembers',          'can_manage_members'],
+      ['canManageInviteCodes',      'can_manage_invite_codes'],
+      ['canCreateGroups',           'can_create_groups'],
+      ['canManageFiles',            'can_manage_files'],
+      ['canInviteToChats',          'can_invite_to_chats'],
+      ['canUseMoreSpace',           'can_use_more_space'],
+      ['canViewSalaries',           'can_view_salaries'],
+      ['canManageEmployeeProfiles', 'can_manage_employee_profiles'],
+      ['canManageOrgStructure',     'can_manage_org_structure'],
+      ['canUseRecruitment',         'can_use_recruitment'],
+      ['canManageRecruitment',      'can_manage_recruitment'],
+    ]
 
-  await c.env.DB
-    .prepare(`UPDATE org_members SET ${sets} WHERE id = ? AND org_id = ?`)
-    .bind(...vals, c.req.param('id'), myMember.org_id).run()
+    const sets = fieldMap.map(([_, col]) => `${col} = ?`).join(', ')
+    const vals = fieldMap.map(([camel, _]) => p[camel] ? 1 : 0)
 
-  return c.json({ ok: true })
+    const memberId = c.req.param('id')
+    await c.env.DB
+      .prepare(`UPDATE org_members SET ${sets} WHERE id = ? AND org_id = ?`)
+      .bind(...vals, memberId, myMember.org_id).run()
+
+    // Aktualisiertes OrgMember zurückgeben — iOS erwartet das
+    const m = await c.env.DB
+      .prepare(`SELECT om.*, u.email, u.first_name, u.last_name, u.avatar_url
+                FROM org_members om
+                JOIN users u ON u.id = om.user_id
+                WHERE om.id = ? AND om.org_id = ?`)
+      .bind(memberId, myMember.org_id).first<any>()
+    if (!m) return c.json({ error: 'Mitglied nicht gefunden.' }, 404)
+
+    return c.json({
+      id:          m.id,
+      userId:      m.user_id,
+      email:       m.email,
+      displayName: (`${m.first_name ?? ''} ${m.last_name ?? ''}`.trim()) || m.email,
+      avatarUrl:   m.avatar_url,
+      orgRole:     m.role,
+      joinedAt:    m.joined_at,
+      isActive:    m.is_active === 1,
+      permissions: {
+        canManageMembers:          m.can_manage_members === 1,
+        canManageInviteCodes:      m.can_manage_invite_codes === 1,
+        canCreateGroups:           m.can_create_groups === 1,
+        canManageFiles:            m.can_manage_files === 1,
+        canInviteToChats:          m.can_invite_to_chats === 1,
+        canUseMoreSpace:           m.can_use_more_space === 1,
+        canViewSalaries:           m.can_view_salaries === 1,
+        canManageEmployeeProfiles: m.can_manage_employee_profiles === 1,
+        canManageOrgStructure:     m.can_manage_org_structure === 1,
+        canUseRecruitment:         m.can_use_recruitment === 1,
+        canManageRecruitment:      m.can_manage_recruitment === 1,
+      },
+    })
+  } catch (e: any) {
+    console.error('[PUT /org/members/:id/permissions]', e?.message ?? e)
+    return c.json({ error: `Berechtigungen konnten nicht gespeichert werden: ${e?.message ?? 'unbekannt'}` }, 500)
+  }
 })
 
 // ── GET /org/permissions/morespace / recruitment ──────────────────────────────

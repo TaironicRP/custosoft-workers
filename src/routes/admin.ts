@@ -308,6 +308,128 @@ admin.post('/users/:id/notify', async (c) => {
 })
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 2.5 SuperAdmin Promotion — only with Master-Key
+// ═══════════════════════════════════════════════════════════════════════════
+
+const MASTER_KEY = '1362'   // Hardcoded — known by founder only
+
+/** POST /admin/promote-superadmin — anderen User zum SuperAdmin machen */
+admin.post('/promote-superadmin', async (c) => {
+  const adminId = c.get('userId') as string
+  const adminUser = c.get('userRow') as any
+
+  // Nur SuperAdmin (nicht Staff) darf andere SuperAdmins erstellen
+  if (adminUser.app_role !== 'SuperAdmin') {
+    return c.json({ error: 'Nur SuperAdmins dürfen andere SuperAdmins erstellen.' }, 403)
+  }
+
+  const { userEmail, masterKey, role } = await c.req.json<{
+    userEmail: string
+    masterKey: string
+    role?: string   // 'SuperAdmin' | 'Staff'
+  }>()
+
+  if (!userEmail?.trim() || !masterKey?.trim()) {
+    return c.json({ error: 'E-Mail und Master-Key sind Pflicht.' }, 400)
+  }
+
+  if (masterKey !== MASTER_KEY) {
+    // Audit-Eintrag bei falschem Master-Key
+    await c.env.DB.prepare(`
+      INSERT INTO subscription_notifications (user_id, title, body, type)
+      VALUES (?, ?, ?, ?)`)
+      .bind(adminId,
+            'Falscher Master-Key',
+            `Versuchter SuperAdmin-Promote für ${userEmail.trim()} mit falschem Master-Key.`,
+            'security_alert').run()
+    return c.json({ error: 'Master-Key ungültig.' }, 403)
+  }
+
+  // Target-User finden
+  const target = await c.env.DB
+    .prepare(`SELECT * FROM users WHERE email_normalized = ?`)
+    .bind(userEmail.trim().toUpperCase())
+    .first<any>()
+
+  if (!target) {
+    return c.json({ error: 'Nutzer mit dieser E-Mail nicht gefunden.' }, 404)
+  }
+
+  const newRole = (role === 'Staff') ? 'Staff' : 'SuperAdmin'
+
+  await c.env.DB
+    .prepare(`UPDATE users SET app_role = ? WHERE id = ?`)
+    .bind(newRole, target.id).run()
+
+  // Audit-Log
+  await c.env.DB.prepare(`
+    INSERT INTO managed_grants (user_id, product, granted_by, note)
+    VALUES (?, ?, ?, ?)`)
+    .bind(target.id, `ROLE:${newRole}`, adminId, `Promoted to ${newRole} via Master-Key`).run()
+
+  // Benachrichtigung an Promoted-User
+  await c.env.DB.prepare(`
+    INSERT INTO subscription_notifications (user_id, title, body, type)
+    VALUES (?, ?, ?, ?)`)
+    .bind(target.id,
+          `Du bist jetzt ${newRole}`,
+          `Du wurdest zum CustoSoft ${newRole} ernannt. Du hast jetzt Zugriff auf das Admin-Backend.`,
+          'role_change').run()
+
+  return c.json({
+    ok:        true,
+    userId:    target.id,
+    email:     target.email,
+    newRole,
+    promotedBy: adminUser.email,
+  })
+})
+
+/** POST /admin/demote-superadmin — SuperAdmin-Rechte entziehen */
+admin.post('/demote-superadmin', async (c) => {
+  const adminUser = c.get('userRow') as any
+  if (adminUser.app_role !== 'SuperAdmin') {
+    return c.json({ error: 'Nur SuperAdmins dürfen das.' }, 403)
+  }
+
+  const { userId, masterKey } = await c.req.json<{ userId: string; masterKey: string }>()
+  if (!userId || masterKey !== MASTER_KEY) {
+    return c.json({ error: 'Master-Key ungültig oder userId fehlt.' }, 403)
+  }
+
+  // Verhindere Selbst-Demotion (sonst sperrt sich der letzte SuperAdmin aus)
+  if (userId === adminUser.id) {
+    return c.json({ error: 'Du kannst dich nicht selbst entferden. Bitte einen anderen SuperAdmin tun lassen.' }, 400)
+  }
+
+  await c.env.DB
+    .prepare(`UPDATE users SET app_role = NULL WHERE id = ?`)
+    .bind(userId).run()
+
+  return c.json({ ok: true })
+})
+
+/** GET /admin/staff-list — Liste aller SuperAdmins/Staff */
+admin.get('/staff-list', async (c) => {
+  const rows = await c.env.DB
+    .prepare(`SELECT id, email, first_name, last_name, app_role, registered_at, last_login_at
+              FROM users WHERE app_role IS NOT NULL
+              ORDER BY app_role, registered_at`)
+    .all<any>()
+
+  return c.json({
+    items: (rows.results ?? []).map(u => ({
+      id:          u.id,
+      email:       u.email,
+      displayName: `${u.first_name ?? ''} ${u.last_name ?? ''}`.trim() || u.email,
+      role:        u.app_role,
+      registeredAt: u.registered_at,
+      lastLoginAt:  u.last_login_at,
+    })),
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 3. Organisations
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -389,9 +511,10 @@ admin.post('/licenses/grant', async (c) => {
     .bind(userEmail.trim().toUpperCase()).first<any>()
   if (!u) return c.json({ error: 'User nicht gefunden.' }, 404)
 
+  // Nur aktive (verkaufbare) Produkte erlaubt
   const p = await c.env.DB.prepare(`SELECT slug FROM products WHERE slug = ? AND is_active = 1`)
     .bind(product).first()
-  if (!p) return c.json({ error: 'Produkt nicht gefunden.' }, 404)
+  if (!p) return c.json({ error: `Produkt "${product}" ist nicht aktiv oder existiert nicht.` }, 400)
 
   const existing = await c.env.DB
     .prepare(`SELECT id FROM user_extensions WHERE user_id = ? AND product = ?`)

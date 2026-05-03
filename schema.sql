@@ -23,9 +23,11 @@ CREATE TABLE IF NOT EXISTS users (
   apple_sub         TEXT    UNIQUE,
   google_sub        TEXT    UNIQUE,
   registered_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-  last_login_at     TEXT
+  last_login_at     TEXT,
+  terminal_code     TEXT    UNIQUE   -- 7-stelliger Code für Wand-Stempeluhr
 );
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email_normalized);
+CREATE INDEX IF NOT EXISTS idx_users_terminal_code ON users(terminal_code);
 
 -- ── Email Verification Tokens ─────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS email_verification_tokens (

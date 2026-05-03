@@ -38,9 +38,9 @@ async function canViewFile(db: any, userId: string, fileRow: any): Promise<boole
   const visibility = fileRow.visibility
 
   if (visibility === VISIBILITY_EVERYONE) {
-    // Must be in same org
+    // Must be active member of same org
     const orgMember = await db
-      .prepare(`SELECT 1 FROM org_members WHERE user_id = ? AND org_id = ?`)
+      .prepare(`SELECT 1 FROM org_members WHERE user_id = ? AND org_id = ? AND is_active = 1`)
       .bind(userId, fileRow.org_id)
       .first()
     return !!orgMember
@@ -50,56 +50,62 @@ async function canViewFile(db: any, userId: string, fileRow: any): Promise<boole
     if (userId === fileRow.created_by_user_id || userId === fileRow.subject_user_id) return true
     const manager = await db
       .prepare(
-        `SELECT can_manage_files FROM org_members WHERE user_id = ? AND org_id = ?`
+        `SELECT can_manage_files, role FROM org_members
+         WHERE user_id = ? AND org_id = ? AND is_active = 1`
       )
       .bind(userId, fileRow.org_id)
-      .first<{ can_manage_files: number }>()
-    return !!(manager?.can_manage_files)
+      .first<{ can_manage_files: number; role: string }>()
+    return !!(manager?.can_manage_files) || ['Owner','Admin'].includes(manager?.role ?? '')
   }
 
-  // VISIBILITY_RESTRICTED
-  return userId === fileRow.created_by_user_id || userId === fileRow.subject_user_id
+  // VISIBILITY_RESTRICTED — owner/subject only, plus Owner role can always read their own org files
+  if (userId === fileRow.created_by_user_id || userId === fileRow.subject_user_id) return true
+  const elevated = await db
+    .prepare(`SELECT role FROM org_members
+              WHERE user_id = ? AND org_id = ? AND is_active = 1 AND role = 'Owner'`)
+    .bind(userId, fileRow.org_id)
+    .first()
+  return !!elevated
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
-// GET /files?userId=
+// GET /files?userId=  ODER  GET /files?includeArchived=true|false (eigene Akten)
 files.get('/', async (c) => {
   const user = c.get('user')
   const db = c.env.DB
   const targetUserId = c.req.query('userId')
+  const includeArchived = c.req.query('includeArchived') === 'true'
 
-  if (!targetUserId) {
-    return c.json({ error: 'userId query parameter is required' }, 400)
+  // Wenn kein targetUserId → alle Akten der eigenen Org laden, gefiltert per canViewFile
+  let sql: string
+  let bindings: any[]
+  if (targetUserId) {
+    sql = `SELECT ef.* FROM employee_files ef
+           WHERE ef.subject_user_id = ?
+             ${includeArchived ? '' : 'AND ef.is_archived = 0'}
+           ORDER BY ef.created_at DESC`
+    bindings = [targetUserId]
+  } else {
+    // Eigene Org bestimmen
+    const me = await db
+      .prepare(`SELECT org_id FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1`)
+      .bind(user.id)
+      .first<{ org_id: number }>()
+    if (!me) return c.json([])  // Kein Org → leere Liste
+    sql = `SELECT ef.* FROM employee_files ef
+           WHERE ef.org_id = ?
+             ${includeArchived ? '' : 'AND ef.is_archived = 0'}
+           ORDER BY ef.created_at DESC`
+    bindings = [me.org_id]
   }
 
-  // Determine requester's org membership
-  const orgMember = await db
-    .prepare(`SELECT org_id, org_role, can_manage_files FROM org_members WHERE user_id = ? LIMIT 1`)
-    .bind(user.id)
-    .first<{ org_id: string; org_role: string; can_manage_files: number }>()
-
-  const canManageFiles =
-    !!(orgMember?.can_manage_files) ||
-    ['Owner', 'Admin'].includes(orgMember?.org_role ?? '')
-
-  const rows = await db
-    .prepare(
-      `SELECT ef.*, u.display_name AS subject_display_name
-       FROM employee_files ef
-       LEFT JOIN users u ON u.id = ef.subject_user_id
-       WHERE ef.subject_user_id = ?
-       ORDER BY ef.created_at DESC`
-    )
-    .bind(targetUserId)
-    .all()
+  const rows = await db.prepare(sql).bind(...bindings).all<any>()
 
   const accessible: any[] = []
   for (const row of rows.results ?? []) {
     const visible = await canViewFile(db, user.id, row)
-    if (visible) {
-      accessible.push(buildFileDto(row))
-    }
+    if (visible) accessible.push(buildFileDto(row))
   }
 
   return c.json(accessible)
@@ -107,75 +113,98 @@ files.get('/', async (c) => {
 
 // POST /files
 files.post('/', async (c) => {
-  const user = c.get('user')
-  const db = c.env.DB
-  const body = await c.req.json<{
-    subjectUserId: string
-    title: string
-    type: string
-    note?: string
-    visibility: number
-    linkedPunchId?: string
-  }>()
+  try {
+    const user = c.get('user')
+    const db = c.env.DB
+    const body = await c.req.json<{
+      subjectUserId?: string | null
+      title?: string
+      type?: string
+      note?: string
+      visibility?: number | null
+      linkedPunchId?: string | null
+    }>()
 
-  if (!body.subjectUserId || !body.title || !body.type) {
-    return c.json({ error: 'subjectUserId, title, and type are required' }, 400)
+    // subjectUserId default = self (eigene Akte)
+    const subjectUserId = (body.subjectUserId ?? '').trim() || user.id
+    const title = (body.title ?? '').trim()
+    const type  = (body.type ?? '').trim()
+
+    if (!title || !type) {
+      return c.json({ error: 'title und type sind Pflichtfelder.' }, 400)
+    }
+
+    // Visibility default = MANAGERS wenn nicht gesetzt
+    const visibility =
+      typeof body.visibility === 'number' &&
+      [VISIBILITY_RESTRICTED, VISIBILITY_MANAGERS, VISIBILITY_EVERYONE].includes(body.visibility)
+        ? body.visibility
+        : VISIBILITY_MANAGERS
+
+    // Aktive Org-Mitgliedschaft des Erstellers (Schema-Spalte heißt 'role', nicht 'org_role')
+    const orgMember = await db
+      .prepare(`SELECT org_id, can_manage_files, role
+                FROM org_members
+                WHERE user_id = ? AND is_active = 1 LIMIT 1`)
+      .bind(user.id)
+      .first<{ org_id: number; can_manage_files: number; role: string }>()
+
+    if (!orgMember) {
+      return c.json({ error: 'Du musst in einer Organisation sein um Akten anzulegen.' }, 403)
+    }
+
+    const canCreate =
+      user.id === subjectUserId ||
+      orgMember.can_manage_files === 1 ||
+      ['Owner', 'Admin'].includes(orgMember.role)
+
+    if (!canCreate) {
+      return c.json({ error: 'Keine Berechtigung Akten für diesen Nutzer anzulegen.' }, 403)
+    }
+
+    // subject_display_name aus users-Tabelle (NOT NULL Schema-Spalte)
+    const subjectUser = await db
+      .prepare(`SELECT first_name, last_name, email FROM users WHERE id = ?`)
+      .bind(subjectUserId)
+      .first<{ first_name: string | null; last_name: string | null; email: string }>()
+    if (!subjectUser) {
+      return c.json({ error: 'Subject-User nicht gefunden.' }, 404)
+    }
+    const subjectDisplayName =
+      (`${subjectUser.first_name ?? ''} ${subjectUser.last_name ?? ''}`.trim()) || subjectUser.email
+
+    // INSERT — id ist INTEGER AUTOINCREMENT (kein UUID)
+    const ins = await db
+      .prepare(
+        `INSERT INTO employee_files
+           (subject_user_id, subject_display_name, org_id, title, type, file_url, note, linked_punch_id, created_by_user_id, visibility, is_archived)
+         VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0)`
+      )
+      .bind(
+        subjectUserId,
+        subjectDisplayName,
+        orgMember.org_id,
+        title,
+        type,
+        body.note ?? null,
+        body.linkedPunchId ?? null,
+        user.id,
+        visibility
+      )
+      .run()
+
+    const newId = Number(ins.meta.last_row_id)
+    const row = await db
+      .prepare(`SELECT ef.* FROM employee_files ef WHERE ef.id = ?`)
+      .bind(newId)
+      .first<any>()
+    if (!row) return c.json({ error: 'Akte nicht gefunden nach Erstellung.' }, 500)
+
+    return c.json(buildFileDto(row), 201)
+  } catch (e: any) {
+    console.error('[POST /files] failed:', e?.message ?? e, e?.stack)
+    return c.json({ error: `Akte konnte nicht erstellt werden: ${e?.message ?? 'unbekannt'}` }, 500)
   }
-
-  if (![VISIBILITY_RESTRICTED, VISIBILITY_MANAGERS, VISIBILITY_EVERYONE].includes(body.visibility)) {
-    return c.json({ error: 'Invalid visibility value (0, 1, or 2)' }, 400)
-  }
-
-  const orgMember = await db
-    .prepare(`SELECT org_id, can_manage_files, org_role FROM org_members WHERE user_id = ? LIMIT 1`)
-    .bind(user.id)
-    .first<{ org_id: string; can_manage_files: number; org_role: string }>()
-
-  if (!orgMember) {
-    return c.json({ error: 'Not in an organisation' }, 403)
-  }
-
-  const canCreate =
-    user.id === body.subjectUserId ||
-    orgMember.can_manage_files === 1 ||
-    ['Owner', 'Admin', 'Manager'].includes(orgMember.org_role)
-
-  if (!canCreate) {
-    return c.json({ error: 'Insufficient permissions to create file for this user' }, 403)
-  }
-
-  const id = crypto.randomUUID()
-
-  await db
-    .prepare(
-      `INSERT INTO employee_files
-         (id, subject_user_id, org_id, title, type, file_url, note, linked_punch_id, created_by_user_id, created_at, visibility, is_archived)
-       VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'), ?, 0)`
-    )
-    .bind(
-      id,
-      body.subjectUserId,
-      orgMember.org_id,
-      body.title.trim(),
-      body.type,
-      body.note ?? null,
-      body.linkedPunchId ?? null,
-      user.id,
-      body.visibility
-    )
-    .run()
-
-  const row = await db
-    .prepare(
-      `SELECT ef.*, u.display_name AS subject_display_name
-       FROM employee_files ef
-       LEFT JOIN users u ON u.id = ef.subject_user_id
-       WHERE ef.id = ?`
-    )
-    .bind(id)
-    .first<any>()
-
-  return c.json(buildFileDto(row), 201)
 })
 
 // GET /files/:id
@@ -186,10 +215,7 @@ files.get('/:id', async (c) => {
 
   const row = await db
     .prepare(
-      `SELECT ef.*, u.display_name AS subject_display_name
-       FROM employee_files ef
-       LEFT JOIN users u ON u.id = ef.subject_user_id
-       WHERE ef.id = ?`
+      `SELECT ef.* FROM employee_files ef WHERE ef.id = ?`
     )
     .bind(id)
     .first<any>()
@@ -221,17 +247,20 @@ files.put('/:id', async (c) => {
     return c.json({ error: 'File not found' }, 404)
   }
 
-  const canEdit = await canViewFile(db, user.id, row)
-  if (!canEdit || (row.created_by_user_id !== user.id)) {
+  // Editing rights: creator, OR canManageFiles, OR Owner/Admin in same org
+  let canEdit = row.created_by_user_id === user.id
+  if (!canEdit) {
     const orgMember = await db
-      .prepare(`SELECT can_manage_files, org_role FROM org_members WHERE user_id = ? AND org_id = ?`)
+      .prepare(`SELECT can_manage_files, role FROM org_members
+                WHERE user_id = ? AND org_id = ? AND is_active = 1`)
       .bind(user.id, row.org_id)
-      .first<{ can_manage_files: number; org_role: string }>()
-    const elevated =
-      orgMember?.can_manage_files === 1 || ['Owner', 'Admin'].includes(orgMember?.org_role ?? '')
-    if (!elevated) {
-      return c.json({ error: 'Access denied' }, 403)
-    }
+      .first<{ can_manage_files: number; role: string }>()
+    canEdit =
+      orgMember?.can_manage_files === 1 ||
+      ['Owner', 'Admin'].includes(orgMember?.role ?? '')
+  }
+  if (!canEdit) {
+    return c.json({ error: 'Keine Berechtigung diese Akte zu bearbeiten.' }, 403)
   }
 
   const body = await c.req.json<{
@@ -264,10 +293,7 @@ files.put('/:id', async (c) => {
 
   const updated = await db
     .prepare(
-      `SELECT ef.*, u.display_name AS subject_display_name
-       FROM employee_files ef
-       LEFT JOIN users u ON u.id = ef.subject_user_id
-       WHERE ef.id = ?`
+      `SELECT ef.* FROM employee_files ef WHERE ef.id = ?`
     )
     .bind(id)
     .first<any>()
@@ -294,21 +320,18 @@ files.delete('/:id', async (c) => {
     return c.json({ error: 'File must be archived before it can be deleted' }, 409)
   }
 
-  const canDelete =
-    row.created_by_user_id === user.id ||
-    !!(await db
-      .prepare(`SELECT can_manage_files FROM org_members WHERE user_id = ? AND org_id = ?`)
+  let canDelete = row.created_by_user_id === user.id
+  if (!canDelete) {
+    const m = await db
+      .prepare(`SELECT can_manage_files, role FROM org_members
+                WHERE user_id = ? AND org_id = ? AND is_active = 1`)
       .bind(user.id, row.org_id)
-      .first<{ can_manage_files: number }>()
-      .then((r) => r?.can_manage_files)) ||
-    !!(await db
-      .prepare(`SELECT org_role FROM org_members WHERE user_id = ? AND org_id = ?`)
-      .bind(user.id, row.org_id)
-      .first<{ org_role: string }>()
-      .then((r) => ['Owner', 'Admin'].includes(r?.org_role ?? '')))
+      .first<{ can_manage_files: number; role: string }>()
+    canDelete = m?.can_manage_files === 1 || ['Owner', 'Admin'].includes(m?.role ?? '')
+  }
 
   if (!canDelete) {
-    return c.json({ error: 'Access denied' }, 403)
+    return c.json({ error: 'Keine Berechtigung diese Akte zu löschen.' }, 403)
   }
 
   await db.prepare(`DELETE FROM employee_files WHERE id = ?`).bind(id).run()
@@ -331,16 +354,17 @@ files.post('/:id/upload', async (c) => {
     return c.json({ error: 'File not found' }, 404)
   }
 
-  const canEdit =
-    row.created_by_user_id === user.id ||
-    !!(await db
-      .prepare(`SELECT can_manage_files FROM org_members WHERE user_id = ? AND org_id = ?`)
-      .bind(user.id, row.org_id)
-      .first<{ can_manage_files: number }>()
-      .then((r) => r?.can_manage_files))
-
+  let canEdit = row.created_by_user_id === user.id
   if (!canEdit) {
-    return c.json({ error: 'Access denied' }, 403)
+    const m = await db
+      .prepare(`SELECT can_manage_files, role FROM org_members
+                WHERE user_id = ? AND org_id = ? AND is_active = 1`)
+      .bind(user.id, row.org_id)
+      .first<{ can_manage_files: number; role: string }>()
+    canEdit = m?.can_manage_files === 1 || ['Owner', 'Admin'].includes(m?.role ?? '')
+  }
+  if (!canEdit) {
+    return c.json({ error: 'Keine Berechtigung Dateien zu dieser Akte hochzuladen.' }, 403)
   }
 
   let fileUrl: string
@@ -366,10 +390,7 @@ files.post('/:id/upload', async (c) => {
 
   const updated = await db
     .prepare(
-      `SELECT ef.*, u.display_name AS subject_display_name
-       FROM employee_files ef
-       LEFT JOIN users u ON u.id = ef.subject_user_id
-       WHERE ef.id = ?`
+      `SELECT ef.* FROM employee_files ef WHERE ef.id = ?`
     )
     .bind(id)
     .first<any>()
@@ -397,16 +418,17 @@ files.patch('/:id', async (c) => {
     return c.json({ error: 'File not found' }, 404)
   }
 
-  const canArchive =
-    row.created_by_user_id === user.id ||
-    !!(await db
-      .prepare(`SELECT can_manage_files, org_role FROM org_members WHERE user_id = ? AND org_id = ?`)
-      .bind(user.id, row.org_id)
-      .first<{ can_manage_files: number; org_role: string }>()
-      .then((r) => r?.can_manage_files === 1 || ['Owner', 'Admin'].includes(r?.org_role ?? '')))
-
+  let canArchive = row.created_by_user_id === user.id
   if (!canArchive) {
-    return c.json({ error: 'Access denied' }, 403)
+    const m = await db
+      .prepare(`SELECT can_manage_files, role FROM org_members
+                WHERE user_id = ? AND org_id = ? AND is_active = 1`)
+      .bind(user.id, row.org_id)
+      .first<{ can_manage_files: number; role: string }>()
+    canArchive = m?.can_manage_files === 1 || ['Owner', 'Admin'].includes(m?.role ?? '')
+  }
+  if (!canArchive) {
+    return c.json({ error: 'Keine Berechtigung diese Akte zu archivieren.' }, 403)
   }
 
   if (body.isArchived) {
@@ -427,10 +449,7 @@ files.patch('/:id', async (c) => {
 
   const updated = await db
     .prepare(
-      `SELECT ef.*, u.display_name AS subject_display_name
-       FROM employee_files ef
-       LEFT JOIN users u ON u.id = ef.subject_user_id
-       WHERE ef.id = ?`
+      `SELECT ef.* FROM employee_files ef WHERE ef.id = ?`
     )
     .bind(id)
     .first<any>()

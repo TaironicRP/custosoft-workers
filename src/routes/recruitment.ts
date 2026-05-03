@@ -43,124 +43,134 @@ function buildApplicationDto(row: any) {
     assignedToUserId: row.assigned_to_user_id ?? row.assignedToUserId ?? null,
     attachmentUrl: row.attachment_url ?? row.attachmentUrl ?? null,
     submittedAt: row.submitted_at ?? row.submittedAt,
-    updatedAt: row.updated_at ?? row.updatedAt,
+    updatedAt: row.last_updated_at ?? row.updated_at ?? row.updatedAt ?? null,
   }
 }
 
-// ─── Protected routes ─────────────────────────────────────────────────────────
-
-recruitment.use('/links*', requireAuth)
-recruitment.use('/applications*', requireAuth)
+// ─── Protected routes (requireAuth direkt an jeder Route, glob-pattern unzuverlässig) ──
 
 // GET /recruitment/links
-recruitment.get('/links', async (c) => {
-  const user = c.get('user')
+recruitment.get('/links', requireAuth, async (c) => {
+  const userId = c.get('userId') as string
   const db = c.env.DB
 
   const orgMember = await db
-    .prepare(`SELECT org_id FROM org_members WHERE user_id = ? LIMIT 1`)
-    .bind(user.id)
-    .first<{ org_id: string }>()
+    .prepare(`SELECT org_id FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1`)
+    .bind(userId).first<{ org_id: number }>()
 
-  if (!orgMember) {
-    return c.json({ error: 'Not in an organisation' }, 403)
-  }
+  if (!orgMember) return c.json([])
 
   const rows = await db
     .prepare(
-      `SELECT jl.*, o.name AS org_name, u.display_name AS created_by_name,
-              p.title AS position_title,
+      `SELECT jl.*, o.name AS org_name, op.title AS position_title,
               (SELECT COUNT(*) FROM job_applications ja WHERE ja.link_id = jl.id) AS used_count
        FROM job_links jl
-       LEFT JOIN orgs o ON o.id = jl.org_id
-       LEFT JOIN users u ON u.id = jl.created_by_user_id
-       LEFT JOIN positions p ON p.id = jl.position_id
+       INNER JOIN organisations o ON o.id = jl.org_id
+       LEFT JOIN org_positions op ON op.id = jl.position_id
        WHERE jl.org_id = ?
        ORDER BY jl.created_at DESC`
     )
     .bind(orgMember.org_id)
-    .all()
+    .all<any>()
 
   return c.json((rows.results ?? []).map(buildLinkDto))
 })
 
 // POST /recruitment/links
-recruitment.post('/links', async (c) => {
-  const user = c.get('user')
+recruitment.post('/links', requireAuth, async (c) => {
+  const userId = c.get('userId') as string
+  const userRow = c.get('userRow') as any
   const db = c.env.DB
 
   const orgMember = await db
-    .prepare(`SELECT org_id, org_role FROM org_members WHERE user_id = ? LIMIT 1`)
-    .bind(user.id)
-    .first<{ org_id: string; org_role: string }>()
+    .prepare(`SELECT org_id, role, can_manage_recruitment FROM org_members
+              WHERE user_id = ? AND is_active = 1 LIMIT 1`)
+    .bind(userId)
+    .first<{ org_id: number; role: string; can_manage_recruitment: number }>()
 
   if (!orgMember) {
-    return c.json({ error: 'Not in an organisation' }, 403)
+    return c.json({ error: 'Du bist in keiner Organisation.' }, 403)
   }
 
-  const canManage = ['Owner', 'Admin', 'Manager'].includes(orgMember.org_role)
+  const canManage = orgMember.role === 'Owner' || orgMember.role === 'Admin' || orgMember.can_manage_recruitment === 1
   if (!canManage) {
-    return c.json({ error: 'Insufficient permissions' }, 403)
+    return c.json({ error: 'Keine Berechtigung um Bewerbungslinks zu erstellen.' }, 403)
   }
 
   const body = await c.req.json<{
     title: string
     description?: string
-    positionId?: string
+    positionId?: number
     expiresAt?: string
   }>()
 
-  if (!body.title) {
-    return c.json({ error: 'title is required' }, 400)
+  if (!body.title?.trim()) {
+    return c.json({ error: 'Titel ist Pflicht.' }, 400)
   }
 
-  // Generate unique code
-  const code = crypto.randomUUID().replace(/-/g, '').substring(0, 12).toUpperCase()
-  const id = crypto.randomUUID()
+  // 8-char URL-friendly Code generieren (kein I/O/0/1 für Lesbarkeit)
+  const codeChars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  const codeBytes = crypto.getRandomValues(new Uint8Array(8))
+  const code = Array.from(codeBytes).map(b => codeChars[b % codeChars.length]).join('')
 
-  await db
+  // Strikt definierte Bindings (D1 lehnt undefined ab — alles muss string|number|null sein)
+  const orgId      = orgMember.org_id ?? null
+  const titleSafe  = body.title.trim()
+  const descSafe   = (body.description && body.description.trim()) ? body.description.trim() : null
+  const positionId = (body.positionId !== undefined && body.positionId !== null) ? body.positionId : null
+  const expiresAt  = (typeof body.expiresAt === 'string' && body.expiresAt.length > 0) ? body.expiresAt : null
+  const createdByName: string =
+    (`${userRow.first_name ?? ''} ${userRow.last_name ?? ''}`).trim() ||
+    (userRow.email ?? '') ||
+    'Admin'
+
+  console.log('[recruitment.links.create] binds:', {
+    orgId: typeof orgId, code: typeof code, titleSafe: typeof titleSafe,
+    descSafe: typeof descSafe, positionId: typeof positionId,
+    userId: typeof userId, createdByName: typeof createdByName,
+    expiresAt: typeof expiresAt,
+    orgIdVal: orgId, userIdVal: userId
+  })
+
+  // Schema: id AUTOINCREMENT (nicht setzen), created_by_name ist Pflicht
+  const result = await db
     .prepare(
-      `INSERT INTO job_links (id, org_id, code, title, description, position_id, created_by_user_id, created_at, expires_at, is_active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'), ?, 1)`
+      `INSERT INTO job_links (org_id, code, title, description, position_id,
+                              created_by_user_id, created_by_name, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .bind(
-      id,
-      orgMember.org_id,
-      code,
-      body.title.trim(),
-      body.description ?? null,
-      body.positionId ?? null,
-      user.id,
-      body.expiresAt ?? null
-    )
+    .bind(orgId, code, titleSafe, descSafe, positionId, userId, createdByName, expiresAt)
     .run()
 
+  const newId = result.meta.last_row_id
+
+  // Vollständige Row mit Joins zurückgeben
   const row = await db
     .prepare(
-      `SELECT jl.*, o.name AS org_name, u.display_name AS created_by_name,
-              p.title AS position_title, 0 AS used_count
+      `SELECT jl.*, o.name AS org_name, op.title AS position_title
        FROM job_links jl
-       LEFT JOIN orgs o ON o.id = jl.org_id
-       LEFT JOIN users u ON u.id = jl.created_by_user_id
-       LEFT JOIN positions p ON p.id = jl.position_id
+       INNER JOIN organisations o ON o.id = jl.org_id
+       LEFT JOIN org_positions op ON op.id = jl.position_id
        WHERE jl.id = ?`
     )
-    .bind(id)
+    .bind(newId)
     .first<any>()
+
+  if (!row) return c.json({ error: 'Link erstellt aber Daten konnten nicht geladen werden.' }, 500)
 
   return c.json(buildLinkDto(row), 201)
 })
 
 // PUT /recruitment/links/:id
-recruitment.put('/links/:id', async (c) => {
+recruitment.put('/links/:id', requireAuth, async (c) => {
   const user = c.get('user')
   const db = c.env.DB
   const id = c.req.param('id')
 
   const orgMember = await db
-    .prepare(`SELECT org_id, org_role FROM org_members WHERE user_id = ? LIMIT 1`)
+    .prepare(`SELECT org_id, role FROM org_members WHERE user_id = ? LIMIT 1`)
     .bind(user.id)
-    .first<{ org_id: string; org_role: string }>()
+    .first<{ org_id: string; role: string }>()
 
   if (!orgMember) {
     return c.json({ error: 'Not in an organisation' }, 403)
@@ -176,7 +186,7 @@ recruitment.put('/links/:id', async (c) => {
   }
 
   const canManage =
-    ['Owner', 'Admin', 'Manager'].includes(orgMember.org_role) ||
+    ['Owner', 'Admin', 'Manager'].includes(orgMember.role) ||
     link.created_by_user_id === user.id
   if (!canManage) {
     return c.json({ error: 'Insufficient permissions' }, 403)
@@ -212,13 +222,13 @@ recruitment.put('/links/:id', async (c) => {
 
   const updated = await db
     .prepare(
-      `SELECT jl.*, o.name AS org_name, u.display_name AS created_by_name,
+      `SELECT jl.*, o.name AS org_name, (u.first_name || " " || u.last_name) AS created_by_name,
               p.title AS position_title,
               (SELECT COUNT(*) FROM job_applications ja WHERE ja.link_id = jl.id) AS used_count
        FROM job_links jl
-       LEFT JOIN orgs o ON o.id = jl.org_id
+       LEFT JOIN organisations o ON o.id = jl.org_id
        LEFT JOIN users u ON u.id = jl.created_by_user_id
-       LEFT JOIN positions p ON p.id = jl.position_id
+       LEFT JOIN org_positions p ON p.id = jl.position_id
        WHERE jl.id = ?`
     )
     .bind(id)
@@ -228,15 +238,15 @@ recruitment.put('/links/:id', async (c) => {
 })
 
 // DELETE /recruitment/links/:id
-recruitment.delete('/links/:id', async (c) => {
+recruitment.delete('/links/:id', requireAuth, async (c) => {
   const user = c.get('user')
   const db = c.env.DB
   const id = c.req.param('id')
 
   const orgMember = await db
-    .prepare(`SELECT org_id, org_role FROM org_members WHERE user_id = ? LIMIT 1`)
+    .prepare(`SELECT org_id, role FROM org_members WHERE user_id = ? LIMIT 1`)
     .bind(user.id)
-    .first<{ org_id: string; org_role: string }>()
+    .first<{ org_id: string; role: string }>()
 
   if (!orgMember) {
     return c.json({ error: 'Not in an organisation' }, 403)
@@ -252,7 +262,7 @@ recruitment.delete('/links/:id', async (c) => {
   }
 
   const canDelete =
-    ['Owner', 'Admin'].includes(orgMember.org_role) || link.created_by_user_id === user.id
+    ['Owner', 'Admin'].includes(orgMember.role) || link.created_by_user_id === user.id
   if (!canDelete) {
     return c.json({ error: 'Insufficient permissions' }, 403)
   }
@@ -263,7 +273,7 @@ recruitment.delete('/links/:id', async (c) => {
 })
 
 // GET /recruitment/applications
-recruitment.get('/applications', async (c) => {
+recruitment.get('/applications', requireAuth, async (c) => {
   const user = c.get('user')
   const db = c.env.DB
   const linkId = c.req.query('linkId')
@@ -303,7 +313,7 @@ recruitment.get('/applications', async (c) => {
 })
 
 // GET /recruitment/applications/:id
-recruitment.get('/applications/:id', async (c) => {
+recruitment.get('/applications/:id', requireAuth, async (c) => {
   const user = c.get('user')
   const db = c.env.DB
   const id = c.req.param('id')
@@ -334,15 +344,15 @@ recruitment.get('/applications/:id', async (c) => {
 })
 
 // PUT /recruitment/applications/:id
-recruitment.put('/applications/:id', async (c) => {
+recruitment.put('/applications/:id', requireAuth, async (c) => {
   const user = c.get('user')
   const db = c.env.DB
   const id = c.req.param('id')
 
   const orgMember = await db
-    .prepare(`SELECT org_id, org_role FROM org_members WHERE user_id = ? LIMIT 1`)
+    .prepare(`SELECT org_id, role FROM org_members WHERE user_id = ? LIMIT 1`)
     .bind(user.id)
-    .first<{ org_id: string; org_role: string }>()
+    .first<{ org_id: string; role: string }>()
 
   if (!orgMember) {
     return c.json({ error: 'Not in an organisation' }, 403)
@@ -373,7 +383,7 @@ recruitment.put('/applications/:id', async (c) => {
        SET status = COALESCE(?, status),
            internal_notes = COALESCE(?, internal_notes),
            assigned_to_user_id = COALESCE(?, assigned_to_user_id),
-           updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+           last_updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
        WHERE id = ?`
     )
     .bind(body.status ?? null, body.internalNotes ?? null, body.assignedToUserId ?? null, id)
@@ -396,13 +406,13 @@ recruitment.get('/public/:code', async (c) => {
 
   const row = await db
     .prepare(
-      `SELECT jl.*, o.name AS org_name, u.display_name AS created_by_name,
+      `SELECT jl.*, o.name AS org_name, (u.first_name || " " || u.last_name) AS created_by_name,
               p.title AS position_title,
               (SELECT COUNT(*) FROM job_applications ja WHERE ja.link_id = jl.id) AS used_count
        FROM job_links jl
-       LEFT JOIN orgs o ON o.id = jl.org_id
+       LEFT JOIN organisations o ON o.id = jl.org_id
        LEFT JOIN users u ON u.id = jl.created_by_user_id
-       LEFT JOIN positions p ON p.id = jl.position_id
+       LEFT JOIN org_positions p ON p.id = jl.position_id
        WHERE jl.code = ? AND jl.is_active = 1`
     )
     .bind(code)
@@ -420,56 +430,82 @@ recruitment.get('/public/:code', async (c) => {
   return c.json(buildLinkDto(row))
 })
 
-// POST /recruitment/public/submit
+// POST /recruitment/public/submit — public, kein Auth nötig
 recruitment.post('/public/submit', async (c) => {
-  const db = c.env.DB
-  const body = await c.req.json<{
-    firstName: string
-    lastName: string
-    email: string
-    phone?: string
-    coverLetter?: string
-    code: string
-  }>()
+  try {
+    const db = c.env.DB
+    const body = await c.req.json<{
+      firstName?: string
+      lastName?: string
+      email?: string
+      phone?: string
+      coverLetter?: string
+      code?: string
+    }>().catch(() => ({}))
 
-  if (!body.firstName || !body.lastName || !body.email || !body.code) {
-    return c.json({ error: 'firstName, lastName, email, and code are required' }, 400)
+    const firstName  = (body.firstName ?? '').trim()
+    const lastName   = (body.lastName ?? '').trim()
+    const email      = (body.email ?? '').trim().toLowerCase()
+    const code       = (body.code ?? '').trim()
+    const phone      = body.phone ?? null
+    const coverLetter = body.coverLetter ?? null
+
+    if (!firstName || !lastName || !email || !code) {
+      return c.json({ error: 'Vorname, Nachname, Email und Bewerbungs-Code sind Pflicht.' }, 400)
+    }
+
+    const link = await db
+      .prepare(`SELECT * FROM job_links WHERE code = ? AND is_active = 1`)
+      .bind(code)
+      .first<any>()
+
+    if (!link) {
+      return c.json({ error: 'Bewerbungs-Code unbekannt oder Stelle nicht mehr aktiv.' }, 404)
+    }
+
+    if (link.expires_at && new Date(link.expires_at) < new Date()) {
+      return c.json({ error: 'Dieser Bewerbungs-Link ist abgelaufen.' }, 410)
+    }
+
+    // Schema: id ist INTEGER AUTOINCREMENT (KEIN UUID-String).
+    // Schema-Spalten: link_title, status default 'New', submitted_at default now(),
+    // last_updated_at (NICHT updated_at).
+    const ins = await db
+      .prepare(
+        `INSERT INTO job_applications
+           (link_id, org_id, link_title, first_name, last_name, email, phone, cover_letter, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'New')`
+      )
+      .bind(
+        link.id,
+        link.org_id,
+        link.title ?? null,
+        firstName,
+        lastName,
+        email,
+        phone,
+        coverLetter
+      )
+      .run()
+
+    const newId = Number(ins.meta.last_row_id)
+
+    // used_count auf dem Link hochzählen
+    await db
+      .prepare(`UPDATE job_links SET used_count = used_count + 1 WHERE id = ?`)
+      .bind(link.id).run()
+
+    // iOS erwartet { id, message } — sowohl alten als auch neuen Key liefern für Compat
+    return c.json({
+      id:            newId,
+      applicationId: newId,
+      ok:            true,
+      message:       'Bewerbung erfolgreich gesendet.'
+    }, 201)
+  } catch (e: any) {
+    console.error('[POST /recruitment/public/submit]', e?.message ?? e, e?.stack)
+    return c.json({ error: `Bewerbung konnte nicht gespeichert werden: ${e?.message ?? 'unbekannt'}` }, 500)
   }
-
-  const link = await db
-    .prepare(`SELECT * FROM job_links WHERE code = ? AND is_active = 1`)
-    .bind(body.code)
-    .first<any>()
-
-  if (!link) {
-    return c.json({ error: 'Invalid or inactive job link' }, 404)
-  }
-
-  if (link.expires_at && new Date(link.expires_at) < new Date()) {
-    return c.json({ error: 'This job link has expired' }, 410)
-  }
-
-  const id = crypto.randomUUID()
-
-  await db
-    .prepare(
-      `INSERT INTO job_applications
-         (id, link_id, org_id, first_name, last_name, email, phone, cover_letter, status, submitted_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', strftime('%Y-%m-%dT%H:%M:%SZ','now'), strftime('%Y-%m-%dT%H:%M:%SZ','now'))`
-    )
-    .bind(
-      id,
-      link.id,
-      link.org_id,
-      body.firstName.trim(),
-      body.lastName.trim(),
-      body.email.trim().toLowerCase(),
-      body.phone ?? null,
-      body.coverLetter ?? null
-    )
-    .run()
-
-  return c.json({ ok: true, applicationId: id }, 201)
 })
 
 // POST /recruitment/public/:applicationId/upload

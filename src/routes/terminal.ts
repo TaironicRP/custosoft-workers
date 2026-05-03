@@ -1,390 +1,306 @@
+// ── Terminal Routes — Wand-Stempeluhr ────────────────────────────────────────
+//
+// Workflow (V2 — Code-basiert):
+//   1. Owner/Admin/User mit TerminalMode-Lizenz aktiviert auf einem Gerät den
+//      Kiosk-Modus.
+//   2. Kiosk-Gerät bleibt mit dem Owner-JWT eingeloggt.
+//   3. Mitarbeiter geben am Kiosk ihren persönlichen 7-stelligen Code ein.
+//   4. POST /terminal/punch-by-code verifiziert den Code und führt direkt die
+//      passende Punch-Aktion aus (toggle in/out / pause / resume) oder gibt
+//      Status zurück damit der User den nächsten Schritt wählen kann.
+//
+// Auth-Modell: Owner-JWT autorisiert die Anwesenheit am Kiosk. Die
+// Mitarbeiter-Identität wird durch den 7-stelligen Code bestätigt.
+// Punch-Daten landen in der GLEICHEN Tabelle (`punch_entries`) wie wenn der
+// Mitarbeiter selbst aus seinem Account stempelt → Status & Stats sind synced.
+
 import { Hono } from 'hono'
 import { requireAuth } from '../middleware/auth'
-import type { Env, AppEnv } from '../types'
-import { hashPassword, verifyPassword } from '../utils/crypto'
+import type { AppEnv } from '../types'
 
 const terminal = new Hono<AppEnv>()
-
 terminal.use('*', requireAuth)
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function getInitials(displayName: string): string {
-  return displayName
-    .split(/\s+/)
-    .slice(0, 2)
-    .map((n) => n.charAt(0).toUpperCase())
-    .join('')
-}
-
-async function getOrgId(db: any, userId: string): Promise<string | null> {
+async function getOrgId(db: D1Database, userId: string): Promise<number | null> {
   const row = await db
-    .prepare(`SELECT org_id FROM org_members WHERE user_id = ? LIMIT 1`)
+    .prepare(`SELECT org_id FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1`)
     .bind(userId)
-    .first<{ org_id: string }>()
+    .first<{ org_id: number }>()
   return row?.org_id ?? null
 }
 
-async function resolveUserByPin(
-  db: any,
-  orgId: string,
-  userId: string,
-  pin: string
-): Promise<{ id: string; displayName: string } | null> {
-  const row = await db
-    .prepare(
-      `SELECT u.id, u.display_name, up.pin_hash
-       FROM users u
-       INNER JOIN org_members om ON om.user_id = u.id AND om.org_id = ?
-       LEFT JOIN user_pins up ON up.user_id = u.id
-       WHERE u.id = ?`
-    )
-    .bind(orgId, userId)
-    .first<{ id: string; display_name: string; pin_hash: string | null }>()
-
-  if (!row || !row.pin_hash) return null
-
-  const valid = await verifyPassword(pin, row.pin_hash)
-  if (!valid) return null
-
-  return { id: row.id, displayName: row.display_name }
+function buildName(first: string | null | undefined, last: string | null | undefined, email: string): string {
+  return (`${first ?? ''} ${last ?? ''}`.trim()) || email
 }
 
-// ─── PIN management ───────────────────────────────────────────────────────────
+/**
+ * Owner/Admin oder TerminalMode-Lizenz erlaubt es das Gerät als Kiosk laufen zu lassen.
+ */
+async function deviceCanRunKiosk(db: D1Database, userId: string): Promise<boolean> {
+  const role = await db
+    .prepare(`SELECT role FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1`)
+    .bind(userId)
+    .first<{ role: string }>()
+  if (role && ['Owner', 'Admin'].includes(role.role)) return true
 
-// GET /terminal/me/pin
-terminal.get('/me/pin', async (c) => {
-  const user = c.get('user')
-  const db = c.env.DB
+  const ext = await db
+    .prepare(`SELECT 1 FROM user_extensions
+              WHERE user_id = ? AND product = 'TerminalMode' AND is_active = 1
+                AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+              LIMIT 1`)
+    .bind(userId)
+    .first()
+  return !!ext
+}
 
+/** Generiert einen 7-stelligen numerischen Code, garantiert kollisionsfrei. */
+async function generateUniqueCode(db: D1Database): Promise<string> {
+  for (let i = 0; i < 50; i++) {
+    const code = String(Math.floor(1_000_000 + Math.random() * 9_000_000))
+    const existing = await db
+      .prepare(`SELECT 1 FROM users WHERE terminal_code = ?`)
+      .bind(code).first()
+    if (!existing) return code
+  }
+  // Fallback: timestamp-basiert
+  return String(1_000_000 + (Date.now() % 9_000_000))
+}
+
+async function ensureTerminalCode(db: D1Database, userId: string): Promise<string> {
   const row = await db
-    .prepare(`SELECT 1 FROM user_pins WHERE user_id = ?`)
-    .bind(user.id)
-    .first()
+    .prepare(`SELECT terminal_code FROM users WHERE id = ?`)
+    .bind(userId)
+    .first<{ terminal_code: string | null }>()
+  if (row?.terminal_code) return row.terminal_code
+  const code = await generateUniqueCode(db)
+  await db.prepare(`UPDATE users SET terminal_code = ? WHERE id = ?`).bind(code, userId).run()
+  return code
+}
 
-  return c.json({ hasPin: !!row })
-})
-
-// PUT /terminal/me/pin
-terminal.put('/me/pin', async (c) => {
-  const user = c.get('user')
-  const db = c.env.DB
-  const body = await c.req.json<{ pin: string }>()
-
-  if (!body.pin || typeof body.pin !== 'string') {
-    return c.json({ error: 'pin is required' }, 400)
+async function currentStatus(db: D1Database, userId: string) {
+  const open = await db
+    .prepare(`SELECT id FROM punch_entries WHERE user_id = ? AND clock_out IS NULL ORDER BY clock_in DESC LIMIT 1`)
+    .bind(userId)
+    .first<{ id: number }>()
+  let isPaused = false
+  if (open) {
+    const pause = await db
+      .prepare(`SELECT 1 FROM pause_entries WHERE punch_entry_id = ? AND resumed_at IS NULL LIMIT 1`)
+      .bind(open.id).first()
+    isPaused = !!pause
   }
+  return { isClockedIn: !!open, isPaused, openId: open?.id ?? null }
+}
 
-  if (body.pin.length < 4 || body.pin.length > 8) {
-    return c.json({ error: 'PIN must be 4–8 characters' }, 400)
+// ─── GET /terminal/me/code — eigenen 7-stelligen Code holen (lazy create) ──
+
+terminal.get('/me/code', async (c) => {
+  try {
+    const userId = c.get('userId') as string
+    const code = await ensureTerminalCode(c.env.DB, userId)
+    return c.json({ code })
+  } catch (e: any) {
+    console.error('[GET /terminal/me/code]', e?.message ?? e)
+    return c.json({ error: `Code konnte nicht geladen werden: ${e?.message ?? 'unbekannt'}` }, 500)
   }
-
-  const hashed = await hashPassword(body.pin)
-
-  await db
-    .prepare(
-      `INSERT INTO user_pins (user_id, pin_hash, updated_at)
-       VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-       ON CONFLICT(user_id) DO UPDATE SET pin_hash = excluded.pin_hash, updated_at = excluded.updated_at`
-    )
-    .bind(user.id, hashed)
-    .run()
-
-  return c.json({ ok: true })
 })
 
-// DELETE /terminal/me/pin
-terminal.delete('/me/pin', async (c) => {
-  const user = c.get('user')
-  const db = c.env.DB
+// ─── POST /terminal/me/code/regenerate — neuen Code erzeugen ───────────────
 
-  await db.prepare(`DELETE FROM user_pins WHERE user_id = ?`).bind(user.id).run()
-
-  return c.json({ ok: true })
+terminal.post('/me/code/regenerate', async (c) => {
+  try {
+    const userId = c.get('userId') as string
+    const code = await generateUniqueCode(c.env.DB)
+    await c.env.DB.prepare(`UPDATE users SET terminal_code = ? WHERE id = ?`).bind(code, userId).run()
+    return c.json({ code })
+  } catch (e: any) {
+    console.error('[POST /terminal/me/code/regenerate]', e?.message ?? e)
+    return c.json({ error: `Code konnte nicht erneuert werden: ${e?.message ?? 'unbekannt'}` }, 500)
+  }
 })
 
-// ─── Kiosk member list ────────────────────────────────────────────────────────
+// ─── GET /terminal/members — Liste aller Org-Mitarbeiter mit aktuellem Status
 
-// GET /terminal/members
 terminal.get('/members', async (c) => {
-  const user = c.get('user')
-  const db = c.env.DB
+  try {
+    const user = c.get('user')
+    const db = c.env.DB
 
-  const orgId = await getOrgId(db, user.id)
-  if (!orgId) {
-    return c.json({ error: 'Not in an organisation' }, 403)
+    const orgId = await getOrgId(db, user.id)
+    if (!orgId) return c.json({ error: 'Nicht in einer Organisation.' }, 403)
+
+    const rows = await db
+      .prepare(
+        `SELECT
+          u.id              AS userId,
+          u.first_name      AS firstName,
+          u.last_name       AS lastName,
+          u.email           AS email,
+          u.avatar_url      AS avatarUrl,
+          (SELECT COUNT(*) FROM punch_entries pe
+             WHERE pe.user_id = u.id AND pe.clock_out IS NULL) > 0 AS isClockedIn,
+          (SELECT COUNT(*) FROM punch_entries pe
+             INNER JOIN pause_entries ps ON ps.punch_entry_id = pe.id AND ps.resumed_at IS NULL
+             WHERE pe.user_id = u.id AND pe.clock_out IS NULL) > 0 AS isPaused
+        FROM org_members om
+        INNER JOIN users u ON u.id = om.user_id
+        WHERE om.org_id = ? AND om.is_active = 1
+        ORDER BY u.first_name, u.last_name`
+      )
+      .bind(orgId)
+      .all<any>()
+
+    const result = (rows.results ?? []).map((m: any) => {
+      const displayName = buildName(m.firstName, m.lastName, m.email)
+      return {
+        userId:      m.userId,
+        displayName,
+        initials:    displayName.split(/\s+/).slice(0, 2).map((s: string) => s.charAt(0).toUpperCase()).join(''),
+        avatarUrl:   m.avatarUrl,
+        isClockedIn: m.isClockedIn === 1,
+        isPaused:    m.isPaused === 1,
+      }
+    })
+
+    return c.json(result)
+  } catch (e: any) {
+    console.error('[GET /terminal/members]', e?.message ?? e)
+    return c.json({ error: `Mitarbeiter konnten nicht geladen werden: ${e?.message ?? 'unbekannt'}` }, 500)
   }
-
-  const rows = await db
-    .prepare(
-      `SELECT
-        u.id AS userId,
-        u.display_name AS displayName,
-        u.position_title AS positionTitle,
-        (up.pin_hash IS NOT NULL) AS hasPin,
-        (
-          SELECT COUNT(*) FROM punch_records pr
-          WHERE pr.user_id = u.id AND pr.clock_out IS NULL
-        ) > 0 AS isClockedIn,
-        (
-          SELECT COUNT(*) FROM punch_records pr
-          INNER JOIN punch_pauses pp ON pp.punch_record_id = pr.id AND pp.resumed_at IS NULL
-          WHERE pr.user_id = u.id AND pr.clock_out IS NULL
-        ) > 0 AS isPaused
-      FROM org_members om
-      INNER JOIN users u ON u.id = om.user_id
-      LEFT JOIN user_pins up ON up.user_id = u.id
-      WHERE om.org_id = ?
-      ORDER BY u.display_name`
-    )
-    .bind(orgId)
-    .all()
-
-  const result = (rows.results ?? []).map((m: any) => ({
-    userId: m.userId,
-    displayName: m.displayName,
-    initials: getInitials(m.displayName ?? ''),
-    positionTitle: m.positionTitle ?? null,
-    hasPin: m.hasPin === 1,
-    isClockedIn: m.isClockedIn === 1,
-    isPaused: m.isPaused === 1,
-  }))
-
-  return c.json(result)
 })
 
-// ─── Terminal punch actions ───────────────────────────────────────────────────
+// ─── POST /terminal/punch-by-code ────────────────────────────────────────────
+// Body: { code: "1234567", action?: 'auto' | 'in' | 'out' | 'pause' | 'resume' }
+//   - 'auto' (Default): toggle basierend auf aktuellem Status
+//                       (nicht eingestempelt → in, eingestempelt aktiv → pause,
+//                        in pause → resume)
+//   - explizit 'in'/'out'/'pause'/'resume' für direkte Aktion
+//
+// Auth: Owner-JWT (Kiosk-Gerät), Code identifiziert Mitarbeiter.
+// Mitarbeiter MUSS in derselben Org sein wie der Kiosk-Owner.
+//
+// Punch-Daten landen in `punch_entries`/`pause_entries` — exakt die gleichen
+// Tabellen die der Mitarbeiter selbst nutzt. Konto-Zeit ist synced.
 
-// POST /terminal/punch/in
-terminal.post('/punch/in', async (c) => {
-  const user = c.get('user')
-  const db = c.env.DB
-  const body = await c.req.json<{ pin: string; userId: string }>()
+terminal.post('/punch-by-code', async (c) => {
+  try {
+    const owner = c.get('user') as any
+    const db = c.env.DB
 
-  if (!body.pin || !body.userId) {
-    return c.json({ error: 'pin and userId are required' }, 400)
+    if (!(await deviceCanRunKiosk(db, owner.id))) {
+      return c.json({ error: 'Dieses Gerät hat keine Wand-Stempeluhr-Berechtigung.' }, 403)
+    }
+
+    const orgId = await getOrgId(db, owner.id)
+    if (!orgId) return c.json({ error: 'Nicht in einer Organisation.' }, 403)
+
+    const body = await c.req.json<{ code?: string; action?: string }>().catch(() => ({}))
+    const code = (body.code ?? '').trim()
+    const action = (body.action ?? 'auto').toLowerCase()
+    if (!code || code.length !== 7 || !/^\d{7}$/.test(code)) {
+      return c.json({ error: 'Ungültiger Code (7 Ziffern erwartet).' }, 400)
+    }
+
+    // Code → User auflösen + Org-Match prüfen
+    const target = await db
+      .prepare(
+        `SELECT u.id, u.first_name, u.last_name, u.email,
+                (SELECT COUNT(*) FROM org_members om WHERE om.user_id = u.id AND om.org_id = ? AND om.is_active = 1) AS sameOrg
+         FROM users u
+         WHERE u.terminal_code = ?`
+      )
+      .bind(orgId, code)
+      .first<any>()
+
+    if (!target)            return c.json({ error: 'Code unbekannt.' }, 404)
+    if (target.sameOrg !== 1) return c.json({ error: 'Mitarbeiter nicht in deiner Organisation.' }, 403)
+
+    const status = await currentStatus(db, target.id)
+    const displayName = buildName(target.first_name, target.last_name, target.email)
+
+    // ── Aktion bestimmen
+    let executed: 'in' | 'out' | 'pause' | 'resume' | 'noop' = 'noop'
+    let message = ''
+    const decideAuto = (): typeof executed => {
+      if (!status.isClockedIn) return 'in'
+      if (status.isPaused)     return 'resume'
+      return 'pause'    // standardmäßig nicht direkt out — User soll bewusst out drücken
+    }
+    const finalAction: typeof executed = action === 'auto' ? decideAuto() :
+      (['in', 'out', 'pause', 'resume'].includes(action) ? (action as any) : decideAuto())
+
+    // ── Aktion ausführen
+    if (finalAction === 'in') {
+      if (status.isClockedIn) return c.json({ error: 'Bereits eingestempelt.', status, displayName }, 409)
+      await db
+        .prepare(`INSERT INTO punch_entries (user_id, org_id, clock_in, pause_seconds, is_manual)
+                  VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'), 0, 0)`)
+        .bind(target.id, orgId)
+        .run()
+      executed = 'in'
+      message = `Eingestempelt — schönen Tag, ${displayName}!`
+    } else if (finalAction === 'out') {
+      if (!status.openId) return c.json({ error: 'Nicht eingestempelt.', status, displayName }, 409)
+      // Falls offene Pause → schließen + pause_seconds aufaddieren
+      const op = await db
+        .prepare(`SELECT * FROM pause_entries WHERE punch_entry_id = ? AND resumed_at IS NULL LIMIT 1`)
+        .bind(status.openId).first<any>()
+      if (op) {
+        const elapsed = Math.floor((Date.now() - new Date(op.paused_at).getTime()) / 1000)
+        await db.prepare(`UPDATE pause_entries SET resumed_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`).bind(op.id).run()
+        await db.prepare(`UPDATE punch_entries SET pause_seconds = pause_seconds + ? WHERE id = ?`).bind(elapsed, status.openId).run()
+      }
+      await db.prepare(`UPDATE punch_entries SET clock_out = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`).bind(status.openId).run()
+      executed = 'out'
+      message = `Ausgestempelt — bis bald, ${displayName}!`
+    } else if (finalAction === 'pause') {
+      if (!status.openId) return c.json({ error: 'Nicht eingestempelt.', status, displayName }, 409)
+      const op = await db
+        .prepare(`SELECT 1 FROM pause_entries WHERE punch_entry_id = ? AND resumed_at IS NULL LIMIT 1`)
+        .bind(status.openId).first()
+      if (op) return c.json({ error: 'Bereits in Pause.', status, displayName }, 409)
+      await db
+        .prepare(`INSERT INTO pause_entries (punch_entry_id, paused_at) VALUES (?, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`)
+        .bind(status.openId).run()
+      executed = 'pause'
+      message = `Pause begonnen — gute Erholung, ${displayName}.`
+    } else if (finalAction === 'resume') {
+      if (!status.openId) return c.json({ error: 'Nicht eingestempelt.', status, displayName }, 409)
+      const op = await db
+        .prepare(`SELECT * FROM pause_entries WHERE punch_entry_id = ? AND resumed_at IS NULL ORDER BY paused_at DESC LIMIT 1`)
+        .bind(status.openId).first<any>()
+      if (!op) return c.json({ error: 'Aktuell nicht in Pause.', status, displayName }, 409)
+      const elapsed = Math.floor((Date.now() - new Date(op.paused_at).getTime()) / 1000)
+      await db.prepare(`UPDATE pause_entries SET resumed_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`).bind(op.id).run()
+      await db.prepare(`UPDATE punch_entries SET pause_seconds = pause_seconds + ? WHERE id = ?`).bind(elapsed, status.openId).run()
+      executed = 'resume'
+      message = `Pause beendet — weiter geht's, ${displayName}!`
+    }
+
+    // Aktueller Status NACH der Aktion zurückgeben — iOS zeigt die nächsten Buttons an
+    const after = await currentStatus(db, target.id)
+    return c.json({
+      ok:           true,
+      action:       executed,
+      message,
+      userId:       target.id,
+      displayName,
+      isClockedIn:  after.isClockedIn,
+      isPaused:     after.isPaused,
+      time:         new Date().toISOString(),
+    })
+  } catch (e: any) {
+    console.error('[POST /terminal/punch-by-code]', e?.message ?? e, e?.stack)
+    return c.json({ error: `Stempelaktion fehlgeschlagen: ${e?.message ?? 'unbekannt'}` }, 500)
   }
-
-  const orgId = await getOrgId(db, user.id)
-  if (!orgId) {
-    return c.json({ error: 'Not in an organisation' }, 403)
-  }
-
-  const target = await resolveUserByPin(db, orgId, body.userId, body.pin)
-  if (!target) {
-    return c.json({ error: 'Invalid PIN or user not found' }, 401)
-  }
-
-  // Check not already clocked in
-  const existing = await db
-    .prepare(`SELECT id FROM punch_records WHERE user_id = ? AND clock_out IS NULL LIMIT 1`)
-    .bind(target.id)
-    .first()
-
-  if (existing) {
-    return c.json({ error: 'Already clocked in' }, 409)
-  }
-
-  const id = crypto.randomUUID()
-  await db
-    .prepare(
-      `INSERT INTO punch_records (id, user_id, org_id, clock_in, clock_out, pause_seconds, note, is_manual)
-       VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'), NULL, 0, NULL, 0)`
-    )
-    .bind(id, target.id, orgId)
-    .run()
-
-  return c.json({
-    ok: true,
-    action: 'clockIn',
-    displayName: target.displayName,
-    time: new Date().toISOString(),
-    note: null,
-  })
 })
 
-// POST /terminal/punch/out
-terminal.post('/punch/out', async (c) => {
-  const user = c.get('user')
-  const db = c.env.DB
-  const body = await c.req.json<{ pin: string; userId: string }>()
+// ─── Legacy-Routes (Email+Passwort-Workflow) — bleiben für Rückwärtskompat ──
 
-  if (!body.pin || !body.userId) {
-    return c.json({ error: 'pin and userId are required' }, 400)
-  }
-
-  const orgId = await getOrgId(db, user.id)
-  if (!orgId) {
-    return c.json({ error: 'Not in an organisation' }, 403)
-  }
-
-  const target = await resolveUserByPin(db, orgId, body.userId, body.pin)
-  if (!target) {
-    return c.json({ error: 'Invalid PIN or user not found' }, 401)
-  }
-
-  const record = await db
-    .prepare(`SELECT * FROM punch_records WHERE user_id = ? AND clock_out IS NULL ORDER BY clock_in DESC LIMIT 1`)
-    .bind(target.id)
-    .first<any>()
-
-  if (!record) {
-    return c.json({ error: 'Not clocked in' }, 409)
-  }
-
-  // Close any open pause
-  const openPause = await db
-    .prepare(
-      `SELECT * FROM punch_pauses WHERE punch_record_id = ? AND resumed_at IS NULL ORDER BY paused_at DESC LIMIT 1`
-    )
-    .bind(record.id)
-    .first<any>()
-
-  if (openPause) {
-    const elapsed = Math.floor(
-      (Date.now() - new Date(openPause.paused_at).getTime()) / 1000
-    )
-    await db
-      .prepare(`UPDATE punch_pauses SET resumed_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`)
-      .bind(openPause.id)
-      .run()
-    await db
-      .prepare(`UPDATE punch_records SET pause_seconds = pause_seconds + ? WHERE id = ?`)
-      .bind(elapsed, record.id)
-      .run()
-  }
-
-  await db
-    .prepare(`UPDATE punch_records SET clock_out = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`)
-    .bind(record.id)
-    .run()
-
-  return c.json({
-    ok: true,
-    action: 'clockOut',
-    displayName: target.displayName,
-    time: new Date().toISOString(),
-    note: null,
-  })
-})
-
-// POST /terminal/punch/pause
-terminal.post('/punch/pause', async (c) => {
-  const user = c.get('user')
-  const db = c.env.DB
-  const body = await c.req.json<{ pin: string; userId: string }>()
-
-  if (!body.pin || !body.userId) {
-    return c.json({ error: 'pin and userId are required' }, 400)
-  }
-
-  const orgId = await getOrgId(db, user.id)
-  if (!orgId) {
-    return c.json({ error: 'Not in an organisation' }, 403)
-  }
-
-  const target = await resolveUserByPin(db, orgId, body.userId, body.pin)
-  if (!target) {
-    return c.json({ error: 'Invalid PIN or user not found' }, 401)
-  }
-
-  const record = await db
-    .prepare(`SELECT * FROM punch_records WHERE user_id = ? AND clock_out IS NULL ORDER BY clock_in DESC LIMIT 1`)
-    .bind(target.id)
-    .first<any>()
-
-  if (!record) {
-    return c.json({ error: 'Not clocked in' }, 409)
-  }
-
-  const openPause = await db
-    .prepare(`SELECT id FROM punch_pauses WHERE punch_record_id = ? AND resumed_at IS NULL LIMIT 1`)
-    .bind(record.id)
-    .first()
-
-  if (openPause) {
-    return c.json({ error: 'Already paused' }, 409)
-  }
-
-  const pauseId = crypto.randomUUID()
-  await db
-    .prepare(
-      `INSERT INTO punch_pauses (id, punch_record_id, paused_at, resumed_at)
-       VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'), NULL)`
-    )
-    .bind(pauseId, record.id)
-    .run()
-
-  return c.json({
-    ok: true,
-    action: 'pause',
-    displayName: target.displayName,
-    time: new Date().toISOString(),
-    note: null,
-  })
-})
-
-// POST /terminal/punch/resume
-terminal.post('/punch/resume', async (c) => {
-  const user = c.get('user')
-  const db = c.env.DB
-  const body = await c.req.json<{ pin: string; userId: string }>()
-
-  if (!body.pin || !body.userId) {
-    return c.json({ error: 'pin and userId are required' }, 400)
-  }
-
-  const orgId = await getOrgId(db, user.id)
-  if (!orgId) {
-    return c.json({ error: 'Not in an organisation' }, 403)
-  }
-
-  const target = await resolveUserByPin(db, orgId, body.userId, body.pin)
-  if (!target) {
-    return c.json({ error: 'Invalid PIN or user not found' }, 401)
-  }
-
-  const record = await db
-    .prepare(`SELECT * FROM punch_records WHERE user_id = ? AND clock_out IS NULL ORDER BY clock_in DESC LIMIT 1`)
-    .bind(target.id)
-    .first<any>()
-
-  if (!record) {
-    return c.json({ error: 'Not clocked in' }, 409)
-  }
-
-  const openPause = await db
-    .prepare(
-      `SELECT * FROM punch_pauses WHERE punch_record_id = ? AND resumed_at IS NULL ORDER BY paused_at DESC LIMIT 1`
-    )
-    .bind(record.id)
-    .first<any>()
-
-  if (!openPause) {
-    return c.json({ error: 'Not paused' }, 409)
-  }
-
-  const elapsed = Math.floor(
-    (Date.now() - new Date(openPause.paused_at).getTime()) / 1000
-  )
-
-  await db
-    .prepare(`UPDATE punch_pauses SET resumed_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`)
-    .bind(openPause.id)
-    .run()
-
-  await db
-    .prepare(`UPDATE punch_records SET pause_seconds = pause_seconds + ? WHERE id = ?`)
-    .bind(elapsed, record.id)
-    .run()
-
-  return c.json({
-    ok: true,
-    action: 'resume',
-    displayName: target.displayName,
-    time: new Date().toISOString(),
-    note: null,
-  })
+terminal.post('/employee-login', async (c) => {
+  return c.json({ error: 'Veralteter Endpoint. Bitte Code-basierten Workflow nutzen.' }, 410)
 })
 
 export default terminal
