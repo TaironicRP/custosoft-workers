@@ -287,12 +287,19 @@ recruitment.get('/applications', requireAuth, async (c) => {
   const status = c.req.query('status')
 
   const orgMember = await db
-    .prepare(`SELECT org_id FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1`)
+    .prepare(`SELECT org_id, role, can_use_recruitment, can_manage_recruitment
+              FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1`)
     .bind(user.id)
-    .first<{ org_id: string }>()
+    .first<{ org_id: string; role: string; can_use_recruitment: number; can_manage_recruitment: number }>()
 
   if (!orgMember) {
     return c.json({ error: 'Not in an organisation' }, 403)
+  }
+
+  const canRead = orgMember.role === 'Owner' || orgMember.role === 'Admin'
+    || orgMember.can_use_recruitment === 1 || orgMember.can_manage_recruitment === 1
+  if (!canRead) {
+    return c.json({ error: 'Keine Berechtigung für Bewerbungs-Inbox' }, 403)
   }
 
   let query = `SELECT ja.* FROM job_applications ja
@@ -326,12 +333,19 @@ recruitment.get('/applications/:id', requireAuth, async (c) => {
   const id = c.req.param('id')
 
   const orgMember = await db
-    .prepare(`SELECT org_id FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1`)
+    .prepare(`SELECT org_id, role, can_use_recruitment, can_manage_recruitment
+              FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1`)
     .bind(user.id)
-    .first<{ org_id: string }>()
+    .first<{ org_id: string; role: string; can_use_recruitment: number; can_manage_recruitment: number }>()
 
   if (!orgMember) {
     return c.json({ error: 'Not in an organisation' }, 403)
+  }
+
+  const canRead = orgMember.role === 'Owner' || orgMember.role === 'Admin'
+    || orgMember.can_use_recruitment === 1 || orgMember.can_manage_recruitment === 1
+  if (!canRead) {
+    return c.json({ error: 'Keine Berechtigung für Bewerbungs-Inbox' }, 403)
   }
 
   const row = await db

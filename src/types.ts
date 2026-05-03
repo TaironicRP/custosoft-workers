@@ -220,6 +220,22 @@ export async function buildUserDto(db: D1Database, u: UserRow) {
   // For now: null — implement as needed
   const pendingInvite = null
 
+  // Individual org permissions — sent so the iOS app can show/hide tabs without
+  // treating every Member as an Admin just to grant Recruitment access.
+  const myOrgPermissions = member ? {
+    canManageMembers:           member.can_manage_members           === 1,
+    canManageInviteCodes:       member.can_manage_invite_codes      === 1,
+    canCreateGroups:            member.can_create_groups            === 1,
+    canManageFiles:             member.can_manage_files             === 1,
+    canInviteToChats:           member.can_invite_to_chats          === 1,
+    canUseMoreSpace:            member.can_use_more_space           === 1,
+    canViewSalaries:            member.can_view_salaries            === 1,
+    canManageEmployeeProfiles:  member.can_manage_employee_profiles === 1,
+    canManageOrgStructure:      member.can_manage_org_structure     === 1,
+    canUseRecruitment:          member.can_use_recruitment          === 1,
+    canManageRecruitment:       member.can_manage_recruitment       === 1,
+  } : null
+
   return {
     id:          u.id,
     email:       u.email,
@@ -229,11 +245,12 @@ export async function buildUserDto(db: D1Database, u: UserRow) {
     appRole:     u.app_role,
     orgId:       member?.org_id ?? null,
     orgRole:     member?.role ?? null,
-    activeExtensions: exts,
-    publicUsername:   u.public_username,
-    nameVisibility:   u.name_visibility,
-    needsOrgWelcome:  member != null && member.org_id !== u.last_seen_org_id,
-    pendingOrgInvite: pendingInvite,
-    emailConfirmed:   u.email_confirmed === 1,
+    activeExtensions:  exts,
+    publicUsername:    u.public_username,
+    nameVisibility:    u.name_visibility,
+    needsOrgWelcome:   member != null && member.org_id !== u.last_seen_org_id,
+    pendingOrgInvite:  pendingInvite,
+    emailConfirmed:    u.email_confirmed === 1,
+    myOrgPermissions,
   }
 }
