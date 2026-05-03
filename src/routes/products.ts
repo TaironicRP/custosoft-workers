@@ -85,7 +85,12 @@ products.get('/my', requireAuth, async (c) => {
 // POST /products/purchase — Apple IAP receipt verification
 products.post('/purchase', requireAuth, async (c) => {
   const userId = c.get('userId') as string
-  const body   = await c.req.json<{ appleTransactionJws: string }>()
+  const body   = await c.req.json<{
+    appleTransactionJws: string
+    productId?: number        // iOS schickt auch productId + slotCount, aber wir lesen aus JWS
+    slotCount?: number
+    appleOriginalTransactionId?: string
+  }>()
 
   if (!body.appleTransactionJws) {
     return c.json({ error: 'appleTransactionJws is required' }, 400)
@@ -115,12 +120,12 @@ products.post('/purchase', requireAuth, async (c) => {
     return c.json({ error: `No active product found for ${appleProductId}` }, 404)
   }
 
-  // Duplicate guard
+  // Duplicate guard — allow re-processing but skip if exact transaction already activated
   if (transactionId) {
     const dup = await c.env.DB
       .prepare(`SELECT id FROM user_extensions WHERE apple_transaction_id = ?`)
-      .bind(transactionId).first()
-    if (dup) return c.json({ ok: true, message: 'Already processed' })
+      .bind(transactionId).first<{ id: number }>()
+    if (dup) return c.json({ ok: true, orderId: dup.id, status: 'Active', activated: true, message: 'Already processed' })
   }
 
   const expiresAt = expiresDateMs ? new Date(expiresDateMs).toISOString() : null
@@ -173,7 +178,17 @@ products.post('/purchase', requireAuth, async (c) => {
     console.error('[purchase] confirmation email failed:', e?.message)
   }
 
-  return c.json({ ok: true })
+  // Fetch created/updated extension id for response
+  const ext = await c.env.DB
+    .prepare(`SELECT id FROM user_extensions WHERE user_id = ? AND product = ?`)
+    .bind(userId, product.slug).first<{ id: number }>()
+
+  return c.json({
+    ok:        true,
+    orderId:   ext?.id ?? 0,
+    status:    'Active',
+    activated: true,
+  })
 })
 
 export default products
