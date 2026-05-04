@@ -906,9 +906,10 @@ E-Mail: <a href="mailto:custosoftsupportde@gmail.com">custosoftsupportde@gmail.c
 <h2>4. Preise und Zahlung</h2>
 <p>Alle Preise werden im App Store in EUR angezeigt. Da der Anbieter Kleinunternehmer gemäß § 19 UStG ist, wird keine Mehrwertsteuer ausgewiesen. Die Abwicklung erfolgt vollständig über Apple; der Anbieter erhält keine Zahlungsdaten.</p>
 <ul>
-  <li><strong>Stempeluhr</strong>: 2,99 € alle 2 Wochen (14 Tage kostenlos testen)</li>
-  <li><strong>Bewerbungsmanager</strong>: 16,99 € einmalig</li>
-  <li><strong>Wand-Stempeluhr</strong>: 9,99 € einmalig</li>
+  <li><strong>Stempeluhr</strong>: 2,99 € pro Woche (Wochen-Abo, jederzeit kündbar)</li>
+  <li><strong>Mehr Platz</strong>: 4,99 € einmalig (Dauerlizenz)</li>
+  <li><strong>Bewerbungsmanager</strong>: 9,99 € einmalig (Dauerlizenz)</li>
+  <li><strong>Wand-Stempeluhr</strong>: 14,99 € einmalig (Dauerlizenz)</li>
   <li><strong>Business Basic</strong>: 49,00 €/Monat oder 469,00 €/Jahr (ca. 39,08 €/Monat)</li>
   <li><strong>Business L</strong>: 89,00 €/Monat oder 849,00 €/Jahr (ca. 70,75 €/Monat)</li>
 </ul>
