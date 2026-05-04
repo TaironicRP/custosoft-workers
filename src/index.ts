@@ -21,6 +21,7 @@ import legal         from './routes/legal'
 import notifications from './routes/notifications'
 import onboarding    from './routes/onboarding'
 import support       from './routes/support'
+import iap           from './routes/iap-notifications'
 import webAdmin      from './routes/web-admin'
 import webPublic     from './routes/web-public'
 
@@ -81,6 +82,7 @@ v1.route('/legal',         legal)
 v1.route('/notifications', notifications)
 v1.route('/onboarding',    onboarding)
 v1.route('/support',       support)
+v1.route('/iap',           iap)        // Apple App Store Server Notifications V2
 
 app.route('/api/v1', v1)
 

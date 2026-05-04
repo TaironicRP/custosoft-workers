@@ -3,6 +3,7 @@ import { Hono }        from 'hono'
 import type { Env, AppEnv } from '../types'
 import { requireAuth } from '../middleware/auth'
 import { sendEmail, purchaseConfirmationHtml, purchaseConfirmationText } from '../utils/email'
+import { verifyAppleJws, isActiveSubscription } from '../utils/apple-iap'
 
 const products = new Hono<AppEnv>()
 
@@ -41,16 +42,9 @@ function buildExtensionDto(row: any) {
   }
 }
 
-/** Decode JWS payload without verifying signature (simplified). */
-function decodeJwsPayload(jws: string): Record<string, any> | null {
-  try {
-    const parts = jws.split('.')
-    if (parts.length < 2) return null
-    const padded = parts[1].replace(/-/g, '+').replace(/_/g, '/')
-    return JSON.parse(atob(padded))
-  } catch {
-    return null
-  }
+/** Erwartete Bundle-ID. Aus Env (APPLE_CLIENT_ID) oder Fallback. */
+function expectedBundleId(env: Env): string {
+  return env.APPLE_CLIENT_ID || 'com.taironic.custosoft'
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
@@ -82,12 +76,12 @@ products.get('/my', requireAuth, async (c) => {
   return c.json((rows.results ?? []).map(buildExtensionDto))
 })
 
-// POST /products/purchase — Apple IAP receipt verification
+// POST /products/purchase — Apple IAP mit Signatur-Verifikation
 products.post('/purchase', requireAuth, async (c) => {
   const userId = c.get('userId') as string
   const body   = await c.req.json<{
     appleTransactionJws: string
-    productId?: number        // iOS schickt auch productId + slotCount, aber wir lesen aus JWS
+    productId?: number        // iOS schickt auch productId, wir lesen aber aus JWS
     slotCount?: number
     appleOriginalTransactionId?: string
   }>()
@@ -96,21 +90,24 @@ products.post('/purchase', requireAuth, async (c) => {
     return c.json({ error: 'appleTransactionJws is required' }, 400)
   }
 
-  const payload = decodeJwsPayload(body.appleTransactionJws)
-  if (!payload) {
-    return c.json({ error: 'Invalid transaction JWS' }, 400)
+  // ── 1. JWS verifizieren (Apple-Signatur prüfen) ───────────────────────────
+  const verify = await verifyAppleJws(body.appleTransactionJws, expectedBundleId(c.env))
+  if (!verify.ok) {
+    console.error('[purchase] JWS-Verifikation fehlgeschlagen:', verify.error, verify.hint)
+    return c.json({ error: verify.error, hint: verify.hint }, 400)
   }
 
-  const appleProductId: string | undefined = payload.productId ?? payload.product_id
+  const payload = verify.payload
+  const appleProductId  = payload.productId
+  const transactionId   = payload.transactionId ?? payload.originalTransactionId
+  const expiresDateMs   = payload.expiresDate
+  const environment     = verify.environment    // "Sandbox" | "Production"
+
   if (!appleProductId) {
-    return c.json({ error: 'Could not extract productId from transaction' }, 400)
+    return c.json({ error: 'productId fehlt im verifizierten JWS-Payload' }, 400)
   }
 
-  const transactionId: string | undefined =
-    payload.transactionId ?? payload.transaction_id ?? payload.originalTransactionId
-  const expiresDateMs: number | undefined = payload.expiresDate
-
-  // Find matching product
+  // ── 2. Produkt aus DB matchen ─────────────────────────────────────────────
   const product = await c.env.DB
     .prepare(`SELECT * FROM products WHERE apple_product_id = ? AND is_active = 1`)
     .bind(appleProductId)
@@ -120,17 +117,27 @@ products.post('/purchase', requireAuth, async (c) => {
     return c.json({ error: `No active product found for ${appleProductId}` }, 404)
   }
 
-  // Duplicate guard — allow re-processing but skip if exact transaction already activated
+  // ── 3. Duplicate Guard ────────────────────────────────────────────────────
   if (transactionId) {
     const dup = await c.env.DB
       .prepare(`SELECT id FROM user_extensions WHERE apple_transaction_id = ?`)
       .bind(transactionId).first<{ id: number }>()
-    if (dup) return c.json({ ok: true, orderId: dup.id, status: 'Active', activated: true, message: 'Already processed' })
+    if (dup) return c.json({
+      ok: true, orderId: dup.id, status: 'Active', activated: true,
+      message: 'Already processed', environment
+    })
+  }
+
+  // ── 4. Subscription noch aktiv? (bei abgelaufenen Renewals nicht aktivieren) ─
+  if (!isActiveSubscription(payload)) {
+    return c.json({
+      error: `Transaction expired (expiresDate=${expiresDateMs ? new Date(expiresDateMs).toISOString() : 'unknown'})`
+    }, 400)
   }
 
   const expiresAt = expiresDateMs ? new Date(expiresDateMs).toISOString() : null
 
-  // Upsert user_extension (using slug as product reference, matching schema)
+  // ── 5. Upsert user_extension ──────────────────────────────────────────────
   const existing = await c.env.DB
     .prepare(`SELECT id FROM user_extensions WHERE user_id = ? AND product = ?`)
     .bind(userId, product.slug).first<any>()
@@ -155,12 +162,12 @@ products.post('/purchase', requireAuth, async (c) => {
       .bind(userId, product.slug, transactionId ?? null, expiresAt).run()
   }
 
-  // Order log
+  // ── 6. Order log ──────────────────────────────────────────────────────────
   await c.env.DB.prepare(
     `INSERT INTO orders (user_id, product_name, price_paid, status) VALUES (?, ?, ?, 'Active')`
   ).bind(userId, product.name, product.price_formatted).run()
 
-  // Confirmation email (don't fail the purchase if email fails)
+  // ── 7. Confirmation email (Fail soft) ────────────────────────────────────
   try {
     const u = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first<any>()
     if (u) {
@@ -178,16 +185,17 @@ products.post('/purchase', requireAuth, async (c) => {
     console.error('[purchase] confirmation email failed:', e?.message)
   }
 
-  // Fetch created/updated extension id for response
   const ext = await c.env.DB
     .prepare(`SELECT id FROM user_extensions WHERE user_id = ? AND product = ?`)
     .bind(userId, product.slug).first<{ id: number }>()
 
   return c.json({
-    ok:        true,
-    orderId:   ext?.id ?? 0,
-    status:    'Active',
-    activated: true,
+    ok:          true,
+    orderId:     ext?.id ?? 0,
+    status:      'Active',
+    activated:   true,
+    environment,
+    expiresAt
   })
 })
 
