@@ -3,6 +3,12 @@ main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
+# workers.dev-Subdomain aktiv halten. Sobald Custom-Routes registriert sind,
+# deaktiviert Cloudflare standardmässig die Default-URL — und solange
+# custosoft.de noch bei Strato liegt (statt Cloudflare-Zone) wäre der Worker
+# dann komplett unerreichbar.
+workers_dev = true
+
 # ── Workers AI / Runtime ────────────────────────────────────────────────────
 [placement]
 mode = "smart"   # Latency-optimised placement
@@ -40,6 +46,16 @@ ALLOWED_ORIGINS = "https://custosoft.de,capacitor://localhost,http://localhost"
 # [[routes]]
 # pattern = "api.custosoft.de/*"
 # zone_name = "custosoft.de"
+
+# Erst aktivieren, sobald custosoft.de in Cloudflare als Zone existiert
+# (Domain-Setup: Strato-Nameserver auf Cloudflare umstellen — siehe DEPLOY.md)
+# [[routes]]
+# pattern = "custosoft.de/*"
+# zone_name = "custosoft.de"
+
+# ── Cron Triggers ─────────────────────────────────────────────────────────────
+[triggers]
+crons = ["0 6 * * *"]   # täglich 06:00 UTC — Subscription Lifecycle
 
 # ── Local Dev (wrangler dev) ─────────────────────────────────────────────────
 [dev]
