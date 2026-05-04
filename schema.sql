@@ -367,7 +367,7 @@ VALUES
    '469,00 €/Jahr',  1, 1, 0, 365, 469.00, 0, 10, 10,
    'de.custosoft.app.business.basic.yearly'),
   ('BusinessL',           'Business L',
-   '50 Mitarbeiter-Slots · alle Team-Features inkl. Bewerbungsmanagement',
+   '50 Mitarbeiter-Slots · Stempeluhr, Akten & Chat fürs ganze Team',
    '89,00 €/Monat',  1, 1, 0,  30,  89.00, 0, 50, 50,
    'de.custosoft.app.business.l.monthly'),
   ('BusinessLYearly',     'Business L Jährlich',
