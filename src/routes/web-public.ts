@@ -25,15 +25,36 @@ const webPublic = new Hono<AppEnv>()
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Load a legal page from D1. */
-async function loadLegal(env: Env, slug: string) {
-  return env.DB.prepare('SELECT title, content FROM legal_pages WHERE slug = ?')
-    .bind(slug).first<{ title: string; content: string }>()
+/**
+ * Load a locale-specific legal-page override from D1.
+ *
+ * Looks up `legal_pages WHERE slug = ? AND locale = ?` first. If the column
+ * `locale` doesn't exist yet (pre-migration), falls back to a slug-only
+ * lookup — but **only** for the development locale (`de`). Other locales
+ * fall through to the in-code default in `legal.ts`, so a German DB
+ * override never bleeds into `/en/privacy`.
+ */
+async function loadLegal(env: Env, slug: string, locale: Locale) {
+  // Try locale-aware lookup (post-migration schema)
+  try {
+    const row = await env.DB
+      .prepare('SELECT title, content FROM legal_pages WHERE slug = ? AND locale = ?')
+      .bind(slug, locale).first<{ title: string; content: string }>()
+    if (row) return row
+  } catch {
+    // `locale` column not present yet — old schema. Continue with legacy path.
+  }
+  // Legacy path: a single row per slug is treated as the German source.
+  if (locale === 'de') {
+    return env.DB.prepare('SELECT title, content FROM legal_pages WHERE slug = ?')
+      .bind(slug).first<{ title: string; content: string }>()
+  }
+  return null
 }
 
 /** Render a legal page for the given canonical slug + locale. */
 async function renderLegal(c: any, canonical: 'impressum' | 'datenschutz' | 'agb' | 'widerruf', locale: Locale) {
-  const p = await loadLegal(c.env, canonical)
+  const p = await loadLegal(c.env, canonical, locale)
   const title = LEGAL_TITLES[canonical][locale]
   let content = p?.content
   if (!content) {

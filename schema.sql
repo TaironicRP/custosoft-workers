@@ -315,12 +315,17 @@ CREATE TABLE IF NOT EXISTS subscription_notifications (
 );
 
 -- ── Legal Pages ───────────────────────────────────────────────────────────
+-- Locale-aware: one row per (slug, locale). Existing pre-i18n DBs need the
+-- migration in scripts/update_legal_pages_locale.sql to rename slug-unique
+-- rows into (slug, 'de') rows.
 CREATE TABLE IF NOT EXISTS legal_pages (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  slug       TEXT    UNIQUE NOT NULL,
+  slug       TEXT    NOT NULL,
+  locale     TEXT    NOT NULL DEFAULT 'de',
   title      TEXT    NOT NULL,
   content    TEXT    NOT NULL DEFAULT '',
-  updated_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+  updated_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  UNIQUE(slug, locale)
 );
 
 -- ── Push Tokens (APNs) ────────────────────────────────────────────────────

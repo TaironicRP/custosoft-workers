@@ -592,9 +592,11 @@ admin.get('/orders', async (c) => {
 
   return c.json({
     items: (rows.results ?? []).map(o => ({
-      id:         o.id, userId: o.user_id, userEmail: o.user_email,
-      productName: o.product_name, pricePaid: o.price_paid,
-      purchasedAt: o.purchased_at, status: o.status,
+      id:           o.id, userId: o.user_id, userEmail: o.user_email,
+      productName:  o.product_name, pricePaid: o.price_paid,
+      purchasedAt:  o.purchased_at, status: o.status,
+      notes:        o.notes ?? null,
+      upgradedFrom: o.upgraded_from ?? null,
     })),
     totalCount: totalRow?.n ?? 0,
     page, pageSize,
@@ -630,11 +632,17 @@ admin.get('/notifications', async (c) => {
 // 8. Legal Pages (Datenschutz, AGB, Impressum) — REQUIRED by Apple
 // ═══════════════════════════════════════════════════════════════════════════
 
+// All endpoints accept an optional `locale` query/body parameter. When
+// missing it defaults to 'de' so old admin UIs keep working unchanged.
+
 admin.get('/legal', async (c) => {
-  const rows = await c.env.DB.prepare(`SELECT * FROM legal_pages ORDER BY slug`).all<any>()
+  // Returns every (slug, locale) pair — admin UI can group by slug.
+  const rows = await c.env.DB.prepare(
+    `SELECT * FROM legal_pages ORDER BY slug, locale`
+  ).all<any>()
   return c.json({
     items: (rows.results ?? []).map(p => ({
-      id: p.id, slug: p.slug, title: p.title,
+      id: p.id, slug: p.slug, locale: p.locale ?? 'de', title: p.title,
       content: p.content, updatedAt: p.updated_at,
     })),
   })
@@ -642,35 +650,71 @@ admin.get('/legal', async (c) => {
 
 admin.get('/legal/:slug', async (c) => {
   const slug = c.req.param('slug')
-  const row = await c.env.DB.prepare(`SELECT * FROM legal_pages WHERE slug = ?`)
-    .bind(slug).first<any>()
+  const locale = c.req.query('locale') ?? 'de'
+  // Try locale-aware lookup first; fall back to legacy schema (slug-only).
+  let row: any = null
+  try {
+    row = await c.env.DB
+      .prepare(`SELECT * FROM legal_pages WHERE slug = ? AND locale = ?`)
+      .bind(slug, locale).first<any>()
+  } catch { /* old schema */ }
+  if (!row && locale === 'de') {
+    row = await c.env.DB.prepare(`SELECT * FROM legal_pages WHERE slug = ?`)
+      .bind(slug).first<any>()
+  }
   if (!row) return c.json({ error: 'Legal-Seite nicht gefunden.' }, 404)
   return c.json({
-    id: row.id, slug: row.slug, title: row.title,
+    id: row.id, slug: row.slug, locale: row.locale ?? 'de', title: row.title,
     content: row.content, updatedAt: row.updated_at,
   })
 })
 
 admin.put('/legal/:slug', async (c) => {
   const slug = c.req.param('slug')
-  const { title, content } = await c.req.json<{ title?: string; content: string }>()
+  const body = await c.req.json<{ title?: string; content: string; locale?: string }>()
+  const { title, content } = body
+  const locale = body.locale ?? c.req.query('locale') ?? 'de'
   if (!content) return c.json({ error: 'content ist Pflicht.' }, 400)
 
-  const exists = await c.env.DB.prepare(`SELECT id FROM legal_pages WHERE slug = ?`)
-    .bind(slug).first()
-
-  if (exists) {
-    await c.env.DB.prepare(`
-      UPDATE legal_pages SET title = ?, content = ?,
-        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE slug = ?`)
-      .bind(title ?? slug, content, slug).run()
-  } else {
-    await c.env.DB.prepare(`
-      INSERT INTO legal_pages (slug, title, content) VALUES (?, ?, ?)`)
-      .bind(slug, title ?? slug, content).run()
+  // Try the new (slug, locale) shape; fall back to legacy slug-only.
+  try {
+    const exists = await c.env.DB
+      .prepare(`SELECT id FROM legal_pages WHERE slug = ? AND locale = ?`)
+      .bind(slug, locale).first()
+    if (exists) {
+      await c.env.DB.prepare(`
+        UPDATE legal_pages SET title = ?, content = ?,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+        WHERE slug = ? AND locale = ?`)
+        .bind(title ?? slug, content, slug, locale).run()
+    } else {
+      await c.env.DB.prepare(`
+        INSERT INTO legal_pages (slug, locale, title, content)
+        VALUES (?, ?, ?, ?)`)
+        .bind(slug, locale, title ?? slug, content).run()
+    }
+    return c.json({ ok: true })
+  } catch {
+    // Old schema (no locale column) — fall back, German only.
+    if (locale !== 'de') {
+      return c.json({
+        error: 'Multi-locale storage requires the legal_pages migration. Run scripts/update_legal_pages_locale.sql.',
+      }, 500)
+    }
+    const exists = await c.env.DB.prepare(`SELECT id FROM legal_pages WHERE slug = ?`)
+      .bind(slug).first()
+    if (exists) {
+      await c.env.DB.prepare(`
+        UPDATE legal_pages SET title = ?, content = ?,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE slug = ?`)
+        .bind(title ?? slug, content, slug).run()
+    } else {
+      await c.env.DB.prepare(`
+        INSERT INTO legal_pages (slug, title, content) VALUES (?, ?, ?)`)
+        .bind(slug, title ?? slug, content).run()
+    }
+    return c.json({ ok: true })
   }
-
-  return c.json({ ok: true })
 })
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -680,6 +724,13 @@ admin.put('/legal/:slug', async (c) => {
 admin.get('/mail-logs', async (c) => {
   // Optional: implement mail_logs table if needed for audit
   return c.json({ items: [] })
+})
+
+admin.get('/beta-signups', async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT * FROM beta_signups ORDER BY created_at DESC`
+  ).all<any>()
+  return c.json({ items: rows.results ?? [], totalCount: rows.results?.length ?? 0 })
 })
 
 export default admin
