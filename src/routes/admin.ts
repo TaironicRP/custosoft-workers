@@ -5,6 +5,15 @@
 import { Hono }                       from 'hono'
 import type { Env, AppEnv } from '../types'
 import { requireStaff }               from '../middleware/auth'
+import {
+  sendEmail,
+  verifyEmailHtml, verifyEmailText,
+  welcomeEmailHtml, welcomeEmailText,
+  changeEmailHtml,  changeEmailText,
+  purchaseConfirmationHtml, purchaseConfirmationText,
+  subscriptionExpiringSoonHtml, subscriptionExpiringSoonText,
+  subscriptionEndedHtml,        subscriptionEndedText,
+} from '../utils/email'
 
 const admin = new Hono<AppEnv>()
 admin.use('*', requireStaff)
@@ -718,13 +727,304 @@ admin.put('/legal/:slug', async (c) => {
 })
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 9. Mail Logs / Audit
+// 9. Mail-System (Logs · Vorlagen · Manueller Versand)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Default-Templates aus utils/email.ts — werden im Admin-UI angezeigt wenn
+/// kein DB-Override existiert. Schlüssel müssen mit den `templateKey`-Werten
+/// in den Auth/Punch/etc.-Routes übereinstimmen die `sendEmail` aufrufen.
+const DEFAULT_TEMPLATE_KEYS = [
+  { key: 'verifyEmail',     name: 'E-Mail-Bestätigung',         vars: '{{name}}, {{code}}' },
+  { key: 'welcome',         name: 'Willkommen',                  vars: '{{name}}' },
+  { key: 'passwordReset',   name: 'Passwort-Reset',              vars: '{{name}}, {{code}}' },
+  { key: 'changeEmail',     name: 'E-Mail-Änderung bestätigen',  vars: '{{name}}, {{newEmail}}, {{code}}' },
+  { key: 'purchase',        name: 'Kauf-Bestätigung',            vars: '{{name}}, {{productName}}, {{price}}' },
+  { key: 'expiringSoon',    name: 'Abo läuft bald ab',           vars: '{{name}}, {{productName}}, {{daysRemaining}}' },
+  { key: 'subscriptionEnded', name: 'Abo beendet',               vars: '{{name}}, {{productName}}' },
+  { key: 'manual',          name: 'Manuelle Nachricht (Admin)',  vars: 'frei' },
+]
+
 admin.get('/mail-logs', async (c) => {
-  // Optional: implement mail_logs table if needed for audit
-  return c.json({ items: [] })
+  const limit = Math.min(500, parseInt(c.req.query('limit') ?? '100'))
+  const status = c.req.query('status')   // 'sent' | 'failed' | undefined
+  const search = c.req.query('q')        // Filter auf to_email / subject
+
+  let q = `SELECT * FROM mail_logs WHERE 1=1`
+  const binds: any[] = []
+  if (status === 'sent' || status === 'failed') {
+    q += ` AND status = ?`; binds.push(status)
+  }
+  if (search) {
+    q += ` AND (to_email LIKE ? OR subject LIKE ? OR template_key LIKE ?)`
+    const pat = `%${search}%`
+    binds.push(pat, pat, pat)
+  }
+  q += ` ORDER BY sent_at DESC LIMIT ?`
+  binds.push(limit)
+
+  try {
+    const rows = await c.env.DB.prepare(q).bind(...binds).all<any>()
+    return c.json({ items: rows.results ?? [] })
+  } catch {
+    return c.json({ items: [], note: 'mail_logs table missing — run scripts/create_mail_tables.sql' })
+  }
 })
+
+admin.get('/mail-templates', async (c) => {
+  // Liste aller Templates: hardcoded Defaults + welche davon DB-Override haben
+  let overrides: any[] = []
+  try {
+    const rows = await c.env.DB.prepare(
+      `SELECT template_key, subject, updated_at, updated_by FROM mail_templates`
+    ).all<any>()
+    overrides = rows.results ?? []
+  } catch { /* table missing */ }
+  const overrideMap: Record<string, any> = {}
+  for (const o of overrides) overrideMap[o.template_key] = o
+
+  return c.json({
+    items: DEFAULT_TEMPLATE_KEYS.map(t => ({
+      key:        t.key,
+      name:       t.name,
+      placeholders: t.vars,
+      hasOverride: !!overrideMap[t.key],
+      subjectOverride: overrideMap[t.key]?.subject ?? null,
+      updatedAt:  overrideMap[t.key]?.updated_at ?? null,
+      updatedBy:  overrideMap[t.key]?.updated_by ?? null,
+    })),
+  })
+})
+
+admin.get('/mail-templates/:key', async (c) => {
+  const key = c.req.param('key')
+  const meta = DEFAULT_TEMPLATE_KEYS.find(t => t.key === key)
+  if (!meta) return c.json({ error: 'Unbekannte Vorlage.' }, 404)
+
+  // Default-Inhalte holen — wir importieren die Helfer aus utils/email
+  const def = renderDefaultTemplate(key)
+
+  let override: any = null
+  try {
+    override = await c.env.DB
+      .prepare(`SELECT subject, html, text, updated_at, updated_by
+                FROM mail_templates WHERE template_key = ?`)
+      .bind(key).first<any>()
+  } catch { /* missing */ }
+
+  return c.json({
+    key,
+    name:        meta.name,
+    placeholders: meta.vars,
+    default: {
+      subject: def.subject,
+      html:    def.html,
+      text:    def.text,
+    },
+    override: override ? {
+      subject:   override.subject,
+      html:      override.html,
+      text:      override.text,
+      updatedAt: override.updated_at,
+      updatedBy: override.updated_by,
+    } : null,
+  })
+})
+
+admin.put('/mail-templates/:key', async (c) => {
+  const key = c.req.param('key')
+  const meta = DEFAULT_TEMPLATE_KEYS.find(t => t.key === key)
+  if (!meta) return c.json({ error: 'Unbekannte Vorlage.' }, 404)
+
+  const body = await c.req.json<{ subject: string; html: string; text?: string }>()
+  if (!body.subject || !body.html) {
+    return c.json({ error: 'subject und html sind Pflicht.' }, 400)
+  }
+  const userId = c.get('userId') as string | undefined
+
+  try {
+    const exists = await c.env.DB.prepare(
+      `SELECT template_key FROM mail_templates WHERE template_key = ?`
+    ).bind(key).first()
+
+    if (exists) {
+      await c.env.DB.prepare(
+        `UPDATE mail_templates
+         SET subject = ?, html = ?, text = ?,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+             updated_by = ?
+         WHERE template_key = ?`
+      ).bind(body.subject, body.html, body.text ?? null, userId ?? null, key).run()
+    } else {
+      await c.env.DB.prepare(
+        `INSERT INTO mail_templates (template_key, subject, html, text, updated_by)
+         VALUES (?, ?, ?, ?, ?)`
+      ).bind(key, body.subject, body.html, body.text ?? null, userId ?? null).run()
+    }
+    return c.json({ ok: true })
+  } catch (e: any) {
+    return c.json({ error: `mail_templates Tabelle fehlt — bitte scripts/create_mail_tables.sql ausführen. (${e?.message ?? e})` }, 500)
+  }
+})
+
+admin.delete('/mail-templates/:key', async (c) => {
+  const key = c.req.param('key')
+  try {
+    await c.env.DB.prepare(`DELETE FROM mail_templates WHERE template_key = ?`).bind(key).run()
+    return c.json({ ok: true, message: 'Override gelöscht — Default-Vorlage greift wieder.' })
+  } catch (e: any) {
+    return c.json({ error: e?.message ?? 'unbekannt' }, 500)
+  }
+})
+
+/// Live-Preview eines Templates mit Test-Daten gefüllt.
+/// Body: { subject, html, vars? } — vars überschreibt Test-Defaults.
+admin.post('/mail-templates/:key/preview', async (c) => {
+  const body = await c.req.json<{
+    subject?: string
+    html?:    string
+    text?:    string
+    vars?:    Record<string, string>
+  }>()
+  const def = renderDefaultTemplate(c.req.param('key'))
+  const subject = body.subject ?? def.subject
+  const html    = body.html    ?? def.html
+  const text    = body.text    ?? def.text
+
+  // Test-Daten falls Caller keine schickt
+  const testVars: Record<string, string> = {
+    name:           'Anna Müller',
+    code:           '123456',
+    newEmail:       'neu@beispiel.de',
+    productName:    'Stempeluhr',
+    price:          '3,99 €/Monat',
+    daysRemaining:  '7',
+    ...(body.vars ?? {}),
+  }
+  const fill = (s: string) => s.replace(/\{\{(\w+)\}\}/g, (_, k) => testVars[k] ?? '')
+  return c.json({
+    subject: fill(subject),
+    html:    fill(html),
+    text:    text ? fill(text) : undefined,
+    vars:    testVars,
+  })
+})
+
+/// Manuellen Versand: Admin tippt Nachricht + wählt Empfänger und schickt los.
+/// Body: { userIds: string[], subject: string, html: string, text?: string }
+admin.post('/mail-send', async (c) => {
+  const adminUserId = c.get('userId') as string
+  const body = await c.req.json<{
+    userIds:  string[]
+    subject:  string
+    html:     string
+    text?:    string
+  }>()
+
+  if (!body.userIds?.length) return c.json({ error: 'Keine Empfänger gewählt.' }, 400)
+  if (!body.subject || !body.html) return c.json({ error: 'subject und html sind Pflicht.' }, 400)
+
+  // Empfänger aus DB laden — Sicherheit: niemals direkt vom Frontend gegebene
+  // E-Mail-Adressen ungeprüft verschicken; immer User-IDs nutzen.
+  const placeholders = body.userIds.map(() => '?').join(',')
+  const usersRes = await c.env.DB
+    .prepare(`SELECT id, email, first_name, last_name FROM users WHERE id IN (${placeholders})`)
+    .bind(...body.userIds)
+    .all<any>()
+  const users = usersRes.results ?? []
+  if (!users.length) return c.json({ error: 'Keine User gefunden.' }, 404)
+
+  let sent = 0, failed = 0
+  for (const u of users) {
+    const name = [u.first_name, u.last_name].filter(Boolean).join(' ') || u.email
+    const fillVars = (s: string) => s.replace(/\{\{(\w+)\}\}/g, (_: any, k: string) => {
+      switch (k) {
+        case 'name':  return name
+        case 'email': return u.email
+        default:      return ''
+      }
+    })
+
+    const ok = await sendEmail({
+      to:           u.email,
+      toName:       name,
+      subject:      fillVars(body.subject),
+      html:         fillVars(body.html),
+      text:         body.text ? fillVars(body.text) : undefined,
+      from:         c.env.FROM_EMAIL,
+      fromName:     c.env.FROM_NAME,
+      apiKey:       c.env.RESEND_API_KEY,
+      db:           c.env.DB,
+      templateKey:  'manual',
+      userId:       u.id,
+      triggeredBy:  adminUserId,
+    })
+    if (ok) sent++; else failed++
+  }
+  return c.json({ ok: true, sent, failed, total: users.length })
+})
+
+// ── Helper: Hardcoded Default-Template-Inhalte holen ──────────────────────
+function renderDefaultTemplate(key: string): { subject: string; html: string; text: string } {
+  // Liefert die hardcoded Default-Vorlage mit `{{platzhaltern}}` befüllt — der
+  // Admin sieht den Original-Code und kann ihn editieren. Beim Speichern
+  // landet die geänderte Version in `mail_templates` und überschreibt zur
+  // Laufzeit den Default.
+  const N = '{{name}}', C = '{{code}}'
+  switch (key) {
+    case 'verifyEmail':
+      return {
+        subject: 'Dein Code: {{code}}',
+        html:    verifyEmailHtml(C, N),
+        text:    verifyEmailText(C, N),
+      }
+    case 'welcome':
+      return {
+        subject: 'Willkommen bei CustoSoft!',
+        html:    welcomeEmailHtml(N),
+        text:    welcomeEmailText(N),
+      }
+    case 'passwordReset':
+      return {
+        subject: 'Dein Passwort-Reset-Code: {{code}}',
+        html:    `<!-- Reset-Mail-Template ist aktuell inline in auth.ts. Editieren überschreibt das beim nächsten Versand. -->`,
+        text:    'Hallo {{name}}, hier ist dein Code zum Zurücksetzen: {{code}}',
+      }
+    case 'changeEmail':
+      return {
+        subject: 'Dein Code: {{code}} – E-Mail-Adresse ändern',
+        html:    changeEmailHtml(C, '{{newEmail}}', N),
+        text:    changeEmailText(C, '{{newEmail}}', N),
+      }
+    case 'purchase':
+      return {
+        subject: 'Bestellbestätigung — {{productName}}',
+        html:    purchaseConfirmationHtml(N, '{{productName}}', '{{price}}', true),
+        text:    purchaseConfirmationText(N, '{{productName}}', '{{price}}', true),
+      }
+    case 'expiringSoon':
+      // signature: (name, productName, daysRemaining, expiresAt)
+      return {
+        subject: 'Dein {{productName}}-Abo läuft bald ab',
+        html:    subscriptionExpiringSoonHtml(N, '{{productName}}', 7, '{{expiresAt}}'),
+        text:    subscriptionExpiringSoonText(N, '{{productName}}', 7, '{{expiresAt}}'),
+      }
+    case 'subscriptionEnded':
+      // signature: (name, productName, endedAt)
+      return {
+        subject: 'Dein {{productName}}-Abo wurde beendet',
+        html:    subscriptionEndedHtml(N, '{{productName}}', new Date().toISOString()),
+        text:    subscriptionEndedText(N, '{{productName}}', new Date().toISOString()),
+      }
+    case 'manual':
+      return {
+        subject: 'Nachricht von CustoSoft',
+        html:    `<p>Hallo {{name}},</p>\n<p>Hier kann der Admin freie Nachrichten schreiben.</p>\n<p>Viele Grüße,<br>Dein CustoSoft Team</p>`,
+        text:    'Hallo {{name}}, hier kann der Admin freie Nachrichten schreiben.',
+      }
+    default:
+      return { subject: '', html: '', text: '' }
+  }
+}
 
 admin.get('/beta-signups', async (c) => {
   const rows = await c.env.DB.prepare(

@@ -58,11 +58,12 @@ products.get('/', async (c) => {
   return c.json((rows.results ?? []).map(buildProductDto))
 })
 
-// GET /products/my — user's active extensions
+// GET /products/my — user's active extensions (eigene + Org-geerbte)
 products.get('/my', requireAuth, async (c) => {
   const userId = c.get('userId') as string
 
-  const rows = await c.env.DB
+  // ── Eigene Extensions ─────────────────────────────────────────────────────
+  const ownRows = await c.env.DB
     .prepare(
       `SELECT * FROM user_extensions
        WHERE user_id = ?
@@ -73,7 +74,38 @@ products.get('/my', requireAuth, async (c) => {
     .bind(userId)
     .all<any>()
 
-  return c.json((rows.results ?? []).map(buildExtensionDto))
+  const ownSlugs = new Set<string>(ownRows.results.map((r: any) => r.product))
+  const dtos     = ownRows.results.map(buildExtensionDto)
+
+  // ── Org-geerbte Extensions (vom Inhaber) ──────────────────────────────────
+  const membership = await c.env.DB
+    .prepare(`SELECT om.org_id, o.owner_id
+              FROM org_members om
+              JOIN organisations o ON o.id = om.org_id
+              WHERE om.user_id = ? AND om.is_active = 1 LIMIT 1`)
+    .bind(userId)
+    .first<{ org_id: number; owner_id: string }>()
+
+  if (membership && membership.owner_id !== userId) {
+    const ownerRows = await c.env.DB
+      .prepare(
+        `SELECT * FROM user_extensions
+         WHERE user_id = ?
+           AND is_active = 1
+           AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         ORDER BY purchased_at DESC`
+      )
+      .bind(membership.owner_id)
+      .all<any>()
+
+    for (const row of ownerRows.results ?? []) {
+      if (!ownSlugs.has(row.product)) {
+        dtos.push({ ...buildExtensionDto(row), grantedVia: 'OrgMembership' })
+      }
+    }
+  }
+
+  return c.json(dtos)
 })
 
 // POST /products/purchase — Apple IAP mit Signatur-Verifikation
@@ -137,7 +169,39 @@ products.post('/purchase', requireAuth, async (c) => {
 
   const expiresAt = expiresDateMs ? new Date(expiresDateMs).toISOString() : null
 
-  // ── 5. Upsert user_extension ──────────────────────────────────────────────
+  // ── Business-Tier-Familie: welche Slugs sind gleich-/niederrangig? ─────────
+  // Basic-Familie: BusinessBasic, BusinessBasicYearly
+  // L-Familie: BusinessL, BusinessLYearly
+  // Upgrade Basic→L deaktiviert alle Basic-Slugs (und umgekehrt bei Downgrade, aber
+  // Apple verhindert Downgrades — wir lassen es trotzdem sauber).
+  const businessBasicSlugs = ['BusinessBasic', 'BusinessBasicYearly', 'Business']
+  const businessLSlugs     = ['BusinessL', 'BusinessLYearly']
+
+  /** Gibt zurück welche anderen Business-Slugs beim Kauf von `slug` deaktiviert werden sollen */
+  function obsoletedBy(slug: string): string[] {
+    if (businessLSlugs.includes(slug))     return businessBasicSlugs  // Upgrade Basic→L
+    if (businessBasicSlugs.includes(slug)) return businessLSlugs      // Downgrade L→Basic (selten)
+    return []
+  }
+
+  const slugsToDeactivate = obsoletedBy(product.slug)
+  let upgradedFrom: string | null = null
+
+  // ── 5. Upsert user_extension + Upgrade-Logik ──────────────────────────────
+  // Wenn ein höherer/anderer Business-Tier gekauft wird: alten deaktivieren
+  if (slugsToDeactivate.length > 0) {
+    const placeholders = slugsToDeactivate.map(() => '?').join(',')
+    const oldExt = await c.env.DB
+      .prepare(`SELECT product FROM user_extensions WHERE user_id = ? AND product IN (${placeholders}) AND is_active = 1 LIMIT 1`)
+      .bind(userId, ...slugsToDeactivate).first<{ product: string }>()
+    if (oldExt) {
+      upgradedFrom = oldExt.product
+      await c.env.DB
+        .prepare(`UPDATE user_extensions SET is_active = 0 WHERE user_id = ? AND product IN (${placeholders})`)
+        .bind(userId, ...slugsToDeactivate).run()
+    }
+  }
+
   const existing = await c.env.DB
     .prepare(`SELECT id FROM user_extensions WHERE user_id = ? AND product = ?`)
     .bind(userId, product.slug).first<any>()
@@ -162,10 +226,27 @@ products.post('/purchase', requireAuth, async (c) => {
       .bind(userId, product.slug, transactionId ?? null, expiresAt).run()
   }
 
-  // ── 6. Order log ──────────────────────────────────────────────────────────
+  // ── 6. Order log (mit Upgrade-Info) ──────────────────────────────────────
+  const upgradeNote = upgradedFrom
+    ? `Upgrade von ${upgradedFrom} → ${product.slug}`
+    : null
   await c.env.DB.prepare(
-    `INSERT INTO orders (user_id, product_name, price_paid, status) VALUES (?, ?, ?, 'Active')`
-  ).bind(userId, product.name, product.price_formatted).run()
+    `INSERT INTO orders (user_id, product_name, price_paid, status, notes, upgraded_from)
+     VALUES (?, ?, ?, 'Active', ?, ?)`
+  ).bind(userId, product.name, product.price_formatted, upgradeNote, upgradedFrom).run()
+
+  // Upgrade-Notification eintragen
+  if (upgradedFrom) {
+    await c.env.DB.prepare(
+      `INSERT INTO subscription_notifications (user_id, title, body, type, ref_id)
+       VALUES (?, ?, ?, 'Upgraded', ?)`
+    ).bind(
+      userId,
+      `Upgrade: ${upgradedFrom} → ${product.slug}`,
+      `Dein Abo wurde von ${upgradedFrom} auf ${product.name} geupgraded.`,
+      transactionId ?? '0'
+    ).run()
+  }
 
   // ── 7. Confirmation email (Fail soft) ────────────────────────────────────
   try {

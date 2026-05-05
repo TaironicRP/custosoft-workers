@@ -461,6 +461,32 @@ org.post('/join', requireAuth, async (c) => {
       .prepare('SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND is_active = 1')
       .bind(org.id).first<{ n: number }>()
 
+    // ── Live-Update: Alle bestehenden Org-Mitglieder (außer dem Neuen) benachrichtigen ──
+    try {
+      const joinerRow = await c.env.DB
+        .prepare('SELECT first_name, last_name, email FROM users WHERE id = ?')
+        .bind(userId).first<any>()
+      const joinerName = joinerRow
+        ? `${joinerRow.first_name ?? ''} ${joinerRow.last_name ?? ''}`.trim() || joinerRow.email
+        : 'Jemand'
+      const existingMembers = await c.env.DB
+        .prepare('SELECT user_id FROM org_members WHERE org_id = ? AND is_active = 1 AND user_id != ?')
+        .bind(inv.org_id, userId).all<{ user_id: string }>()
+      const notifStmt = c.env.DB.prepare(
+        `INSERT INTO subscription_notifications (user_id, title, body, type, ref_id)
+         VALUES (?, ?, ?, 'OrgMemberJoined', ?)`
+      )
+      const notifBatch = (existingMembers.results ?? []).map(m =>
+        notifStmt.bind(m.user_id, 'Neues Mitglied', `${joinerName} ist der Organisation beigetreten.`, String(inv.org_id))
+      )
+      if (notifBatch.length > 0) {
+        await c.env.DB.batch(notifBatch)
+      }
+    } catch (notifErr: any) {
+      // Nicht-kritisch — Beitritt trotzdem erfolgreich
+      console.warn('[POST /org/join] notification insert failed:', notifErr?.message)
+    }
+
     return c.json({
       id:               org.id,
       name:             org.name,

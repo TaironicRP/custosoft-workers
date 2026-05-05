@@ -190,7 +190,9 @@ export function displayName(u: UserRow): string {
   return full || u.email
 }
 
-/** Active extensions for a user — deduplicated slugs */
+/** Active extensions for a user — deduplicated slugs.
+ *  Org-Mitglieder erben alle aktiven Extensions des Org-Inhabers.
+ *  MoreSpace ist seit v5 in allen Business-Packs (Basic, L) inklusive. */
 export async function activeExtensions(db: D1Database, userId: string): Promise<string[]> {
   const now = new Date().toISOString()
   const rows = await db
@@ -199,7 +201,37 @@ export async function activeExtensions(db: D1Database, userId: string): Promise<
                 AND (expires_at IS NULL OR expires_at > ?)`)
     .bind(userId, now)
     .all<{ product: string }>()
-  return rows.results.map(r => r.product)
+  const slugs = rows.results.map(r => r.product)
+
+  // Org-Mitglieder erben alle aktiven Extensions des Org-Inhabers
+  const membership = await db
+    .prepare(`SELECT om.org_id, o.owner_id
+              FROM org_members om
+              JOIN organisations o ON o.id = om.org_id
+              WHERE om.user_id = ? AND om.is_active = 1 LIMIT 1`)
+    .bind(userId)
+    .first<{ org_id: number; owner_id: string }>()
+
+  if (membership && membership.owner_id !== userId) {
+    const ownerRows = await db
+      .prepare(`SELECT DISTINCT product FROM user_extensions
+                WHERE user_id = ? AND is_active = 1
+                  AND (expires_at IS NULL OR expires_at > ?)`)
+      .bind(membership.owner_id, now)
+      .all<{ product: string }>()
+    for (const r of ownerRows.results) {
+      if (!slugs.includes(r.product)) slugs.push(r.product)
+    }
+  }
+
+  // Business-Packs inkludieren MoreSpace — auch wenn kein eigener MoreSpace-Kauf vorliegt
+  const businessSlugs = ['BusinessBasic', 'BusinessBasicYearly', 'BusinessL', 'BusinessLYearly', 'Business']
+  const hasAnyBusiness = slugs.some(s => businessSlugs.includes(s))
+  if (hasAnyBusiness && !slugs.includes('MoreSpace')) {
+    slugs.push('MoreSpace')
+  }
+
+  return slugs
 }
 
 /** Build AppUserDto (camelCase — matches iOS Model exactly) */

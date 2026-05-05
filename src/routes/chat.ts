@@ -519,7 +519,8 @@ chat.post('/:id/messages', async (c) => {
   }
 })
 
-// Alias für Kompatibilität (alte iOS-App nutzt /send)
+// Alias für Kompatibilität (iOS-App nutzt /send statt /messages).
+// Akzeptiert dieselben Felder wie /messages — inkl. Attachment-Daten.
 chat.post('/:id/send', async (c) => {
   try {
     const userId = c.get('userId') as string
@@ -530,9 +531,29 @@ chat.post('/:id/send', async (c) => {
       return c.json({ error: 'Du bist kein Mitglied dieses Chats.' }, 403)
     }
 
-    const body = await c.req.json<{ body?: string }>().catch(() => ({}))
+    // ReadOnly-Channel: nur Owner/AppStaff dürfen schreiben
+    const conv = await db
+      .prepare(`SELECT is_read_only FROM conversations WHERE id = ?`)
+      .bind(convId)
+      .first<{ is_read_only: number }>()
+    if (!conv) return c.json({ error: 'Chat nicht gefunden.' }, 404)
+    if (conv.is_read_only === 1) {
+      return c.json({ error: 'Dieser Chat ist nur lesbar.' }, 403)
+    }
+
+    const body = await c.req.json<{
+      body?: string
+      attachmentUrl?: string
+      attachmentName?: string
+      attachmentType?: string
+      attachmentBytes?: number
+    }>().catch(() => ({}))
     const text = (body.body ?? '').trim()
-    if (!text) return c.json({ error: 'Nachricht darf nicht leer sein.' }, 400)
+    const hasAttachment = !!body.attachmentUrl
+    // Wichtig: leerer Text + Anhang ist erlaubt (z.B. Foto ohne Caption).
+    if (!text && !hasAttachment) {
+      return c.json({ error: 'Nachricht darf nicht leer sein.' }, 400)
+    }
 
     const senderRow = await db
       .prepare(`SELECT first_name, last_name, email FROM users WHERE id = ?`)
@@ -541,9 +562,17 @@ chat.post('/:id/send', async (c) => {
     const senderName = buildName(senderRow?.first_name, senderRow?.last_name, senderRow?.email ?? 'Unbekannt')
 
     const ins = await db
-      .prepare(`INSERT INTO messages (conversation_id, sender_id, sender_name, body, is_system)
-                VALUES (?, ?, ?, ?, 0)`)
-      .bind(convId, userId, senderName, text)
+      .prepare(`INSERT INTO messages
+                  (conversation_id, sender_id, sender_name, body, is_system,
+                   attachment_url, attachment_name, attachment_type, attachment_bytes)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)`)
+      .bind(
+        convId, userId, senderName, text,
+        body.attachmentUrl  ?? null,
+        body.attachmentName ?? null,
+        body.attachmentType ?? null,
+        body.attachmentBytes ?? null
+      )
       .run()
     const newId = Number(ins.meta.last_row_id)
 
@@ -566,10 +595,10 @@ chat.post('/:id/send', async (c) => {
       body:            row.body,
       sentAt:          row.sent_at,
       isSystem:        row.is_system === 1,
-      attachmentUrl:   null,
-      attachmentName:  null,
-      attachmentType:  null,
-      attachmentBytes: null,
+      attachmentUrl:   row.attachment_url,
+      attachmentName:  row.attachment_name,
+      attachmentType:  row.attachment_type,
+      attachmentBytes: row.attachment_bytes,
     }, 201)
   } catch (e: any) {
     console.error('[POST /conversations/:id/send]', e?.message ?? e)

@@ -5,12 +5,24 @@ import { buildUserDto } from '../types'
 import { requireAuth }  from '../middleware/auth'
 import { signToken }    from '../utils/jwt'
 import { hashPassword, verifyPassword, randomCode, randomToken, uuid } from '../utils/crypto'
+import { uploadToR2, parseFileUpload, deleteFromR2 } from '../utils/r2'
 import {
   sendEmail,
   verifyEmailHtml, verifyEmailText,
   passwordResetHtml, passwordResetText,
   welcomeEmailHtml, welcomeEmailText,
+  changeEmailHtml, changeEmailText,
+  pickLang,
 } from '../utils/email'
+
+/// Liefert die bevorzugte Sprache eines Users — erst aus DB-Spalte,
+/// dann Accept-Language-Header (frische Registrierungen wo noch kein
+/// users.language existiert), default `'de'`.
+function userLang(c: any, dbLang: string | null | undefined): 'de' | 'en' {
+  if (dbLang) return pickLang(dbLang)
+  const accept = c.req.header?.('Accept-Language') ?? ''
+  return pickLang(accept.split(',')[0])
+}
 
 const auth = new Hono<{ Bindings: Env }>()
 
@@ -38,7 +50,7 @@ auth.post('/login', async (c) => {
   if (!user)       return c.json({ error: 'Ungültige E-Mail-Adresse oder Passwort.' }, 401)
   if (user.is_blocked) return c.json({ error: 'Dein Konto wurde gesperrt.' }, 401)
   if (!user.password_hash)
-    return c.json({ error: 'Bitte verwende Apple- oder Google-Anmeldung.' }, 401)
+    return c.json({ error: 'Bitte verwende „Mit Apple anmelden".' }, 401)
 
   const ok = await verifyPassword(password, user.password_hash)
   if (!ok)   return c.json({ error: 'Ungültige E-Mail-Adresse oder Passwort.' }, 401)
@@ -88,23 +100,31 @@ auth.post('/register', async (c) => {
     'INSERT INTO email_verification_tokens (user_id, code, expires_at) VALUES (?, ?, ?)'
   ).bind(id, code, expires).run()
 
+  const lang = userLang(c, null)
+  // Sprache vermerken — ab jetzt landet jede zukünftige Email lokalisiert
+  try {
+    await c.env.DB.prepare('UPDATE users SET language = ? WHERE id = ?').bind(lang, id).run()
+  } catch { /* language column may not exist yet (pre-migration) */ }
+
   // ⚠️ MÜSSEN await haben — Workers terminieren sonst vor dem Email-Versand
   await sendEmail({
     to: email, toName: name,
-    subject: `Dein Code: ${code}`,
-    text: verifyEmailText(code, name),
-    html: verifyEmailHtml(code, name),
+    subject: lang === 'en' ? `Your code: ${code}` : `Dein Code: ${code}`,
+    text: verifyEmailText(code, name, lang),
+    html: verifyEmailHtml(code, name, lang),
     from: c.env.FROM_EMAIL, fromName: c.env.FROM_NAME,
     apiKey: c.env.RESEND_API_KEY,
+    db: c.env.DB, templateKey: 'verifyEmail', userId: id,
   })
 
   await sendEmail({
     to: email, toName: name,
-    subject: 'Willkommen bei CustoSoft!',
-    text: welcomeEmailText(name),
-    html: welcomeEmailHtml(name),
+    subject: lang === 'en' ? 'Welcome to CustoSoft!' : 'Willkommen bei CustoSoft!',
+    text: welcomeEmailText(name, lang),
+    html: welcomeEmailHtml(name, lang),
     from: c.env.FROM_EMAIL, fromName: c.env.FROM_NAME,
     apiKey: c.env.RESEND_API_KEY,
+    db: c.env.DB, templateKey: 'welcome', userId: id,
   })
 
   return c.json(await buildResponse(c.env.DB, c.env.JWT_SECRET, user))
@@ -112,61 +132,85 @@ auth.post('/register', async (c) => {
 
 // ── POST /apple ───────────────────────────────────────────────────────────────
 auth.post('/apple', async (c) => {
-  const { identityToken, email, displayName } =
+  const { identityToken, email: bodyEmail, displayName } =
     await c.req.json<{ identityToken: string; email?: string; displayName?: string }>()
   if (!identityToken) return c.json({ error: 'Kein Identity-Token.' }, 400)
 
-  // Verify Apple JWT
-  let appleSub: string
+  // Verify Apple JWT — sub + email kommen aus dem signierten Payload (vertrauenswürdig).
+  let applePayload: { sub: string; email?: string }
   try {
-    appleSub = await verifyAppleToken(identityToken, c.env.APPLE_CLIENT_ID)
+    applePayload = await verifyAppleToken(identityToken, c.env.APPLE_CLIENT_ID)
   } catch (e: any) {
     return c.json({ error: `Apple-Token ungültig: ${e.message}` }, 401)
   }
+  const appleSub = applePayload.sub
 
-  // Find or create user
+  // 1. Bevorzugt: User mit dieser apple_sub schon vorhanden → einloggen.
   let user = await c.env.DB
     .prepare('SELECT * FROM users WHERE apple_sub = ?')
     .bind(appleSub).first<any>()
 
-  if (!user && email) {
-    // Check by email first (link accounts)
+  if (!user) {
+    // Email ermitteln: signierter Token-Claim hat Vorrang vor dem Body
+    // (Apple sendet email beim ersten Login; iOS sendet "" bei Folge-Logins.)
+    const email = (applePayload.email ?? bodyEmail ?? '').trim().toLowerCase()
+    if (!email) {
+      return c.json({
+        error: 'E-Mail nicht im Apple-Token enthalten. Bitte unter Einstellungen → Apple-ID → ' +
+               '„Anmelden mit Apple" → CustoSoft entfernen und erneut anmelden.'
+      }, 400)
+    }
+
+    // 2. Existing user mit dieser Email? → Apple-Login dranlinken.
     user = await c.env.DB
       .prepare('SELECT * FROM users WHERE email_normalized = ?')
-      .bind(email.trim().toUpperCase()).first<any>()
+      .bind(email.toUpperCase()).first<any>()
 
     if (user) {
-      // Link Apple to existing account
       await c.env.DB
         .prepare('UPDATE users SET apple_sub = ? WHERE id = ?')
         .bind(appleSub, user.id).run()
     } else {
-      // New user via Apple
-      const id    = uuid()
-      const name  = displayName?.trim() || email.split('@')[0]
-      const parts = name.split(' ')
-      await c.env.DB.prepare(`
-        INSERT INTO users (id, email, email_normalized, first_name, last_name, apple_sub, email_confirmed)
-        VALUES (?, ?, ?, ?, ?, ?, 1)
-      `).bind(
-        id, email.trim().toLowerCase(), email.trim().toUpperCase(),
-        parts[0] ?? name, parts.slice(1).join(' '),
-        appleSub, 1
-      ).run()
+      // 3. Brand-new Apple-Registrierung.
+      // → Email-Code-Bestätigung (gleicher Flow wie /register).
+      const id        = uuid()
+      const rawName   = displayName?.trim() || email.split('@')[0]
+      const parts     = rawName.split(' ')
+      const firstName = parts[0] || rawName
+      const lastName  = parts.slice(1).join(' ')
+
+      try {
+        await c.env.DB.prepare(`
+          INSERT INTO users (id, email, email_normalized, first_name, last_name, apple_sub, email_confirmed)
+          VALUES (?, ?, ?, ?, ?, ?, 0)
+        `).bind(id, email, email.toUpperCase(), firstName, lastName, appleSub).run()
+      } catch (e: any) {
+        console.error('[POST /auth/apple] INSERT users failed:', e?.message ?? e)
+        return c.json({ error: `Account konnte nicht erstellt werden: ${e?.message ?? 'unbekannt'}` }, 500)
+      }
+
       user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(id).first<any>()
 
+      // Verification-Code generieren + per Mail senden
+      const code    = randomCode()
+      const expires = new Date(Date.now() + 3600_000).toISOString()
+      await c.env.DB
+        .prepare('INSERT INTO email_verification_tokens (user_id, code, expires_at) VALUES (?, ?, ?)')
+        .bind(id, code, expires).run()
+
       await sendEmail({
-        to: email, toName: name,
-        subject: 'Willkommen bei CustoSoft!',
-        text: welcomeEmailText(name),
-        html: welcomeEmailHtml(name),
+        to: email, toName: rawName,
+        subject: `Dein Code: ${code}`,
+        text: verifyEmailText(code, rawName),
+        html: verifyEmailHtml(code, rawName),
         from: c.env.FROM_EMAIL, fromName: c.env.FROM_NAME,
         apiKey: c.env.RESEND_API_KEY,
+        db: c.env.DB, templateKey: 'verifyEmail', userId: id,
       })
     }
   }
 
-  if (!user)       return c.json({ error: 'Apple-Anmeldung fehlgeschlagen.' }, 401)
+  if (!user)           return c.json({ error: 'Apple-Anmeldung fehlgeschlagen.' }, 401)
   if (user.is_blocked) return c.json({ error: 'Dein Konto wurde gesperrt.' }, 401)
 
   await c.env.DB
@@ -243,6 +287,7 @@ Der Code ist 30 Minuten gültig. Wenn du diesen Code nicht angefordert hast, ign
         subject, text, html,
         from: c.env.FROM_EMAIL, fromName: c.env.FROM_NAME,
         apiKey: c.env.RESEND_API_KEY,
+        db: c.env.DB, templateKey: 'passwordReset', userId: user.id,
       })
       if (!sent) {
         console.error('[POST /auth/forgot] sendEmail returned false for', user.email,
@@ -338,6 +383,7 @@ auth.post('/resend-verification', requireAuth, async (c) => {
     html: verifyEmailHtml(code, name),
     from: c.env.FROM_EMAIL, fromName: c.env.FROM_NAME,
     apiKey: c.env.RESEND_API_KEY,
+    db: c.env.DB, templateKey: 'verifyEmail', userId: userId,
   })
 
   return c.json({ ok: true })
@@ -393,6 +439,21 @@ auth.put('/me/username', requireAuth, async (c) => {
   return c.json(await buildUserDto(c.env.DB, user))
 })
 
+// ── PUT /me/language — DE/EN für lokalisierte E-Mails setzen ─────────────────
+auth.put('/me/language', requireAuth, async (c) => {
+  const userId = c.get('userId') as string
+  const { language } = await c.req.json<{ language: string }>().catch(() => ({ language: '' }))
+  const lang = pickLang(language)
+  try {
+    await c.env.DB
+      .prepare('UPDATE users SET language = ? WHERE id = ?')
+      .bind(lang, userId).run()
+  } catch (e: any) {
+    return c.json({ error: 'language Spalte fehlt — scripts/add_user_language.sql ausführen.' }, 500)
+  }
+  return c.json({ ok: true, language: lang })
+})
+
 // ── PUT /me/name-visibility ───────────────────────────────────────────────────
 auth.put('/me/name-visibility', requireAuth, async (c) => {
   const { visibility } = await c.req.json<{ visibility: string }>()
@@ -426,6 +487,202 @@ auth.post('/me/ack-org-welcome', requireAuth, async (c) => {
   return c.json(await buildUserDto(c.env.DB, user))
 })
 
+// ── POST /me/avatar — Profilbild hochladen ────────────────────────────────────
+// Multipart-Upload (`file` field). Speichert in R2 unter `avatars/`,
+// löscht das alte Avatar-File und aktualisiert users.avatar_url.
+// Limits: 8 MB, image/* Content-Type.
+auth.post('/me/avatar', requireAuth, async (c) => {
+  const userId = c.get('userId') as string
+
+  const upload = await parseFileUpload(c.req.raw)
+  if (!upload) return c.json({ error: 'Keine Datei hochgeladen.' }, 400)
+
+  if (!upload.contentType.startsWith('image/')) {
+    return c.json({ error: 'Nur Bilddateien erlaubt (PNG, JPG, HEIC, WEBP).' }, 415)
+  }
+
+  const MAX_BYTES = 8 * 1024 * 1024 // 8 MB
+  if (upload.file.byteLength > MAX_BYTES) {
+    return c.json({ error: 'Bild zu groß. Maximal 8 MB.' }, 413)
+  }
+
+  // Bestehendes Avatar holen (für Cleanup nach erfolgreichem Upload)
+  const prev = await c.env.DB
+    .prepare('SELECT avatar_url FROM users WHERE id = ?')
+    .bind(userId).first<{ avatar_url: string | null }>()
+
+  // R2-Upload
+  const result = await uploadToR2(
+    c.env.UPLOADS,
+    upload.file,
+    upload.filename || 'avatar.jpg',
+    upload.contentType,
+    'avatars',
+  )
+
+  // DB updaten
+  await c.env.DB
+    .prepare('UPDATE users SET avatar_url = ? WHERE id = ?')
+    .bind(result.url, userId).run()
+
+  // Altes Avatar aus R2 entfernen — nur wenn es ein eigener Upload war
+  if (prev?.avatar_url && prev.avatar_url.startsWith('/uploads/avatars/')) {
+    try {
+      await deleteFromR2(c.env.UPLOADS, prev.avatar_url)
+    } catch (e) {
+      console.warn('[POST /me/avatar] alte Datei löschen fehlgeschlagen:', e)
+    }
+  }
+
+  const user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first<any>()
+  return c.json(await buildUserDto(c.env.DB, user))
+})
+
+// ── DELETE /me/avatar — Profilbild entfernen ──────────────────────────────────
+auth.delete('/me/avatar', requireAuth, async (c) => {
+  const userId = c.get('userId') as string
+
+  const prev = await c.env.DB
+    .prepare('SELECT avatar_url FROM users WHERE id = ?')
+    .bind(userId).first<{ avatar_url: string | null }>()
+
+  await c.env.DB
+    .prepare('UPDATE users SET avatar_url = NULL WHERE id = ?')
+    .bind(userId).run()
+
+  if (prev?.avatar_url && prev.avatar_url.startsWith('/uploads/avatars/')) {
+    try {
+      await deleteFromR2(c.env.UPLOADS, prev.avatar_url)
+    } catch (e) {
+      console.warn('[DELETE /me/avatar] R2-Cleanup fehlgeschlagen:', e)
+    }
+  }
+
+  const user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first<any>()
+  return c.json(await buildUserDto(c.env.DB, user))
+})
+
+// ── POST /me/change-password ──────────────────────────────────────────────────
+auth.post('/me/change-password', requireAuth, async (c) => {
+  const userId = c.get('userId') as string
+  const { currentPassword, newPassword } =
+    await c.req.json<{ currentPassword: string; newPassword: string }>()
+
+  if (!currentPassword || !newPassword)
+    return c.json({ error: 'Aktuelles und neues Passwort sind erforderlich.' }, 400)
+
+  if (newPassword.length < 8)
+    return c.json({ error: 'Das neue Passwort muss mindestens 8 Zeichen haben.' }, 400)
+
+  const user = await c.env.DB
+    .prepare('SELECT * FROM users WHERE id = ?')
+    .bind(userId).first<any>()
+
+  if (!user || !user.password_hash)
+    return c.json({ error: 'Kein Passwort gesetzt (Apple-Login-Account).' }, 400)
+
+  const ok = await verifyPassword(currentPassword, user.password_hash)
+  if (!ok)
+    return c.json({ error: 'Das aktuelle Passwort ist falsch.' }, 401)
+
+  const newHash = await hashPassword(newPassword)
+  await c.env.DB
+    .prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+    .bind(newHash, userId).run()
+
+  return c.json({ success: true })
+})
+
+// ── POST /me/change-email/request ─────────────────────────────────────────────
+auth.post('/me/change-email/request', requireAuth, async (c) => {
+  const userId = c.get('userId') as string
+  const { newEmail } = await c.req.json<{ newEmail: string }>()
+
+  if (!newEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail))
+    return c.json({ error: 'Bitte gib eine gültige E-Mail-Adresse ein.' }, 400)
+
+  const newEmailNorm = newEmail.trim().toUpperCase()
+
+  // Prüfen ob die neue E-Mail schon vergeben ist
+  const existing = await c.env.DB
+    .prepare('SELECT id FROM users WHERE email_normalized = ? AND id != ?')
+    .bind(newEmailNorm, userId).first<any>()
+  if (existing)
+    return c.json({ error: 'Diese E-Mail-Adresse wird bereits verwendet.' }, 409)
+
+  const user = await c.env.DB
+    .prepare('SELECT * FROM users WHERE id = ?')
+    .bind(userId).first<any>()
+  if (!user) return c.json({ error: 'Benutzer nicht gefunden.' }, 404)
+
+  const code    = randomCode()
+  const expires = new Date(Date.now() + 3600_000).toISOString()
+
+  // Alte noch nicht verwendete Tokens für diesen User invalidieren
+  await c.env.DB
+    .prepare('UPDATE email_change_tokens SET used = 1 WHERE user_id = ? AND used = 0')
+    .bind(userId).run()
+
+  await c.env.DB
+    .prepare('INSERT INTO email_change_tokens (user_id, new_email, code, expires_at) VALUES (?, ?, ?, ?)')
+    .bind(userId, newEmail.trim(), code, expires).run()
+
+  const name = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.email
+
+  const sent = await sendEmail({
+    to: newEmail.trim(), toName: name,
+    subject: `Dein Code: ${code} – E-Mail-Adresse ändern`,
+    text: changeEmailText(code, newEmail.trim(), name),
+    html: changeEmailHtml(code, newEmail.trim(), name),
+    db: c.env.DB, templateKey: 'changeEmail', userId: userId,
+    from: c.env.FROM_EMAIL, fromName: c.env.FROM_NAME,
+    apiKey: c.env.RESEND_API_KEY,
+  })
+
+  if (!sent) return c.json({ error: 'E-Mail konnte nicht gesendet werden. Bitte versuche es später erneut.' }, 500)
+
+  return c.json({ success: true })
+})
+
+// ── POST /me/change-email/confirm ─────────────────────────────────────────────
+auth.post('/me/change-email/confirm', requireAuth, async (c) => {
+  const userId = c.get('userId') as string
+  const { newEmail, code } = await c.req.json<{ newEmail: string; code: string }>()
+
+  if (!newEmail || !code)
+    return c.json({ error: 'E-Mail und Code sind erforderlich.' }, 400)
+
+  const newEmailNorm = newEmail.trim().toUpperCase()
+
+  const token = await c.env.DB
+    .prepare(`SELECT * FROM email_change_tokens
+       WHERE user_id = ? AND new_email = ? AND code = ? AND used = 0
+         AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now')
+       ORDER BY id DESC LIMIT 1`)
+    .bind(userId, newEmail.trim(), code.trim()).first<any>()
+
+  if (!token)
+    return c.json({ error: 'Ungültiger oder abgelaufener Code.' }, 400)
+
+  // Prüfen ob die neue E-Mail zwischenzeitlich von jemand anderem belegt wurde
+  const conflict = await c.env.DB
+    .prepare('SELECT id FROM users WHERE email_normalized = ? AND id != ?')
+    .bind(newEmailNorm, userId).first<any>()
+  if (conflict)
+    return c.json({ error: 'Diese E-Mail-Adresse wird bereits verwendet.' }, 409)
+
+  await c.env.DB
+    .prepare('UPDATE users SET email = ?, email_normalized = ? WHERE id = ?')
+    .bind(newEmail.trim(), newEmailNorm, userId).run()
+
+  await c.env.DB
+    .prepare('UPDATE email_change_tokens SET used = 1 WHERE id = ?')
+    .bind(token.id).run()
+
+  const user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first<any>()
+  return c.json({ success: true, user: await buildUserDto(c.env.DB, user) })
+})
+
 // ── DELETE /me/delete ─────────────────────────────────────────────────────────
 auth.delete('/me/delete', requireAuth, async (c) => {
   const userId = c.get('userId') as string
@@ -434,7 +691,10 @@ auth.delete('/me/delete', requireAuth, async (c) => {
 })
 
 // ── Apple Token Verification ──────────────────────────────────────────────────
-async function verifyAppleToken(identityToken: string, clientId: string): Promise<string> {
+async function verifyAppleToken(
+  identityToken: string,
+  clientId: string,
+): Promise<{ sub: string; email?: string; email_verified?: boolean }> {
   // Fetch Apple's public keys
   const keysRes = await fetch('https://appleid.apple.com/auth/keys')
   const { keys } = await keysRes.json<{ keys: any[] }>()
@@ -468,7 +728,11 @@ async function verifyAppleToken(identityToken: string, clientId: string): Promis
   if (payload.aud !== clientId) throw new Error('Wrong audience')
   if (payload.exp < Date.now() / 1000) throw new Error('Token expired')
 
-  return payload.sub as string
+  return {
+    sub: payload.sub as string,
+    email: typeof payload.email === 'string' ? payload.email : undefined,
+    email_verified: payload.email_verified === true || payload.email_verified === 'true',
+  }
 }
 
 // ── POST /auth/apple/notifications — Apple Server-to-Server Events ────────────

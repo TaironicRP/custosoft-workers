@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS users (
   google_sub        TEXT    UNIQUE,
   registered_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
   last_login_at     TEXT,
-  terminal_code     TEXT    UNIQUE   -- 7-stelliger Code für Wand-Stempeluhr
+  terminal_code     TEXT    UNIQUE,  -- 7-stelliger Code für Wand-Stempeluhr
+  language          TEXT    NOT NULL DEFAULT 'de'   -- 'de' | 'en' — für lokalisierte E-Mails
 );
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email_normalized);
 CREATE INDEX IF NOT EXISTS idx_users_terminal_code ON users(terminal_code);
@@ -348,6 +349,41 @@ CREATE TABLE IF NOT EXISTS managed_grants (
   note         TEXT
 );
 
+-- ── Mail Logs (audit aller verschickten Emails) ──────────────────────────
+-- Wird vom sendEmail-Helper bei jedem Versand-Versuch beschrieben — egal ob
+-- Erfolg oder Fail. Ermöglicht im Admin-Dashboard ein vollständiges Versand-
+-- Log mit Filter nach Status / Empfänger / Vorlage.
+CREATE TABLE IF NOT EXISTS mail_logs (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  template_key  TEXT,                            -- z.B. 'welcome', 'verifyEmail', 'manual'
+  to_email      TEXT    NOT NULL,
+  to_name       TEXT,
+  from_email    TEXT,
+  subject       TEXT,
+  status        TEXT    NOT NULL,                -- 'sent' | 'failed'
+  error_message TEXT,                            -- nur bei status='failed'
+  resend_id     TEXT,                            -- Resend-Antwort-ID
+  sent_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  user_id       TEXT,                            -- optionale Verknüpfung wenn Empfänger ein User ist
+  triggered_by  TEXT                             -- Admin-User-ID wenn manuell verschickt
+);
+CREATE INDEX IF NOT EXISTS idx_mail_logs_to    ON mail_logs(to_email);
+CREATE INDEX IF NOT EXISTS idx_mail_logs_when  ON mail_logs(sent_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mail_logs_tpl   ON mail_logs(template_key);
+
+-- ── Mail Templates (Override-Layer für hardcoded Templates) ─────────────
+-- Fehlt ein Eintrag → es greift die hardcoded Default-Vorlage aus utils/email.ts.
+-- Existiert ein Eintrag → er überschreibt die Default-Vorlage. Im Admin-Dashboard
+-- lassen sich Subject + HTML-Body editieren mit Live-Preview des Original-HTML.
+CREATE TABLE IF NOT EXISTS mail_templates (
+  template_key  TEXT    PRIMARY KEY,             -- 'welcome', 'verifyEmail', 'passwordReset', etc.
+  subject       TEXT    NOT NULL,
+  html          TEXT    NOT NULL,                -- mit Platzhaltern wie {{name}}, {{code}}, ...
+  text          TEXT,                            -- Plain-Text-Fallback
+  updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  updated_by    TEXT
+);
+
 -- ═══════════════════════════════════════════════════════════════════════════
 -- Seed Data: Products
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -360,8 +396,8 @@ INSERT OR IGNORE INTO products
    starting_slots, max_slots, apple_product_id)
 VALUES
   ('PunchClock',          'Stempeluhr',
-   'Zeiterfassung für eine Person — wöchentliches Abo, jederzeit kündbar.',
-   '2,99 €/Woche',   1, 1, 0,   7,   2.99, 0, 1,  1,
+   'Zeiterfassung für eine Person — monatliches Abo, jederzeit kündbar.',
+   '3,99 €/Monat',   1, 1, 0,  30,   3.99, 0, 1,  1,
    'de.custosoft.app.punchclock'),
   ('BusinessBasic',       'Business Basic',
    '10 Mitarbeiter-Slots · Stempeluhr · Akten · Chat',

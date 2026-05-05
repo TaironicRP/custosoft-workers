@@ -8,14 +8,16 @@ notifications.use('*', requireAuth)
 
 function buildDto(row: any) {
   return {
-    id:        row.id,
-    userId:    row.user_id,
-    title:     row.title,
-    body:      row.body,
-    type:      row.type,
-    refId:     row.ref_id ?? null,
-    isRead:    (row.is_read ?? 0) === 1,
-    createdAt: row.created_at,
+    id:           row.id,
+    userId:       row.user_id,
+    title:        row.title,
+    body:         row.body,
+    message:      row.body,    // iOS-Compat: ServerNotification.message
+    type:         row.type,
+    kind:         row.type,    // iOS-Compat: ServerNotification.kind
+    refId:        row.ref_id ?? null,
+    isRead:       (row.is_read ?? 0) === 1,
+    createdAt:    row.created_at,
   }
 }
 

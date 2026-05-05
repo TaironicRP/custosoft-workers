@@ -24,6 +24,7 @@ import support       from './routes/support'
 import iap           from './routes/iap-notifications'
 import webAdmin      from './routes/web-admin'
 import webPublic     from './routes/web-public'
+import { runSubscriptionLifecycle } from './cron/subscriptionLifecycle'
 
 // ── App ───────────────────────────────────────────────────────────────────────
 const app = new Hono<{ Bindings: Env }>()
@@ -123,4 +124,9 @@ app.onError((err, c) => {
   return c.json({ error: 'Interner Serverfehler.' }, 500)
 })
 
-export default app
+export default {
+  fetch: app.fetch,
+  async scheduled(_event: unknown, env: Env, ctx: { waitUntil(p: Promise<unknown>): void }): Promise<void> {
+    ctx.waitUntil(runSubscriptionLifecycle(env))
+  },
+}

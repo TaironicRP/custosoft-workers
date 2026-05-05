@@ -147,6 +147,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
         <a data-tab="grants">🎁 <span>Manuelle Vergaben</span></a>
         <a data-tab="orders">💳 <span>Bestellungen</span></a>
         <a data-tab="notifications">🔔 <span>Benachrichtigungen</span></a>
+        <a data-tab="emails">📧 <span>E-Mails</span></a>
         <a data-tab="legal">📜 <span>Rechtstexte</span></a>
         <a data-tab="staff">🛡️ <span>Staff &amp; SuperAdmin</span></a>
       </nav>
@@ -237,6 +238,77 @@ const ADMIN_HTML = `<!DOCTYPE html>
         <h2>Rechtstexte</h2>
         <p class="sub">Datenschutzerklärung · AGB · Impressum (Apple-Pflicht)</p>
         <div id="legalList" style="display:flex;flex-direction:column;gap:12px;margin-top:16px"></div>
+      </section>
+
+      <!-- EMAILS -->
+      <section data-section="emails" style="display:none">
+        <h2>E-Mails</h2>
+        <p class="sub">Versand-Log · Vorlagen · manueller Versand über taironic.media@gmail.com</p>
+
+        <!-- Sub-Tabs: Logs · Vorlagen · Senden -->
+        <div class="email-tabs" style="display:flex;gap:8px;margin:16px 0">
+          <button class="btn email-tab active" data-emailtab="logs">📋 Versand-Log</button>
+          <button class="btn email-tab" data-emailtab="templates">📝 Vorlagen</button>
+          <button class="btn email-tab" data-emailtab="compose">✍️ Senden</button>
+        </div>
+
+        <!-- LOGS -->
+        <div data-emailpanel="logs">
+          <div class="toolbar" style="margin-bottom:12px">
+            <input type="search" id="mailLogSearch" placeholder="Suchen (E-Mail, Betreff, Vorlage)…">
+            <select id="mailLogStatus">
+              <option value="">Alle</option>
+              <option value="sent">Erfolgreich</option>
+              <option value="failed">Fehlgeschlagen</option>
+            </select>
+            <button class="btn" onclick="loadMailLogs()">↻ Aktualisieren</button>
+          </div>
+          <div class="table-wrap"><table>
+            <thead><tr>
+              <th>Zeit</th><th>An</th><th>Betreff</th><th>Vorlage</th><th>Status</th><th>Fehler</th>
+            </tr></thead>
+            <tbody id="mailLogBody"></tbody>
+          </table></div>
+        </div>
+
+        <!-- TEMPLATES -->
+        <div data-emailpanel="templates" style="display:none">
+          <div id="mailTemplatesList" style="display:flex;flex-direction:column;gap:10px"></div>
+        </div>
+
+        <!-- COMPOSE -->
+        <div data-emailpanel="compose" style="display:none">
+          <div style="display:grid;grid-template-columns: 1fr 1.4fr;gap:18px">
+            <!-- Empfänger-Liste -->
+            <div>
+              <label class="lbl">Empfänger</label>
+              <input type="search" id="mailRecipSearch" placeholder="Nutzer suchen…" style="margin:6px 0 8px">
+              <div id="mailRecipList" style="height:380px;overflow-y:auto;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:6px"></div>
+              <div style="margin-top:8px;font-size:11px;color:rgba(255,255,255,0.5)">
+                <span id="mailRecipSelected">0</span> ausgewählt
+              </div>
+            </div>
+            <!-- Editor + Vorschau -->
+            <div>
+              <label class="lbl">Betreff</label>
+              <input type="text" id="mailSubject" placeholder="Betreff der Email" style="margin-top:6px">
+              <label class="lbl" style="margin-top:12px">HTML-Inhalt <span style="color:rgba(255,255,255,0.4);font-weight:400">(Variablen: {{name}}, {{email}})</span></label>
+              <textarea id="mailHtml" rows="12" placeholder="<p>Hallo {{name}},</p>" style="margin-top:6px;font-family:ui-monospace,monospace;font-size:12px"></textarea>
+              <label class="lbl" style="margin-top:12px">Plain-Text-Fallback (optional)</label>
+              <textarea id="mailText" rows="3" placeholder="Hallo {{name}}, …" style="margin-top:6px;font-family:ui-monospace,monospace;font-size:12px"></textarea>
+              <div style="display:flex;gap:10px;margin-top:14px">
+                <button class="btn" onclick="previewCompose()">👁 Vorschau</button>
+                <button class="btn ok" onclick="sendCompose()">✉ Senden</button>
+              </div>
+              <div id="mailComposeStatus" style="margin-top:12px;font-size:13px"></div>
+              <!-- Live-Vorschau -->
+              <div style="margin-top:18px">
+                <label class="lbl">Live-Vorschau</label>
+                <iframe id="mailComposePreview" style="width:100%;height:340px;border:1px solid rgba(255,255,255,0.08);border-radius:10px;background:#fff;margin-top:6px"></iframe>
+              </div>
+            </div>
+          </div>
+        </div>
       </section>
 
       <!-- STAFF & SUPERADMIN -->
@@ -402,10 +474,306 @@ document.querySelectorAll('.sidebar nav a').forEach(a => {
     else if (tab === 'grants')   loadGrants()
     else if (tab === 'orders')   loadOrders()
     else if (tab === 'notifications') loadNotifications()
+    else if (tab === 'emails')   onEmailsTabOpen()
     else if (tab === 'legal')    loadLegal()
     else if (tab === 'staff')    loadStaff()
   })
 })
+
+// ════════════════════════════════════════════════════════════════════════
+// E-MAIL-SYSTEM (Logs · Vorlagen · Senden)
+// ════════════════════════════════════════════════════════════════════════
+
+let emailUsersCache = []   // cached list of users for the recipient picker
+let emailSelectedIds = new Set()
+
+function onEmailsTabOpen() {
+  // Sub-tab handlers (idempotent — bind once)
+  document.querySelectorAll('.email-tab').forEach(b => {
+    if (b._wired) return
+    b._wired = true
+    b.addEventListener('click', () => {
+      document.querySelectorAll('.email-tab').forEach(x => x.classList.remove('active'))
+      b.classList.add('active')
+      const which = b.dataset.emailtab
+      document.querySelectorAll('[data-emailpanel]').forEach(p =>
+        p.style.display = p.dataset.emailpanel === which ? '' : 'none'
+      )
+      if (which === 'logs')      loadMailLogs()
+      if (which === 'templates') loadMailTemplates()
+      if (which === 'compose')   loadComposeRecipients()
+    })
+  })
+  // Default: Logs
+  loadMailLogs()
+}
+
+// ── Versand-Log ─────────────────────────────────────────────────────────
+async function loadMailLogs() {
+  const tbody = document.getElementById('mailLogBody')
+  tbody.innerHTML = '<tr><td colspan="6" class="loading">Lade…</td></tr>'
+  const q      = document.getElementById('mailLogSearch')?.value ?? ''
+  const status = document.getElementById('mailLogStatus')?.value ?? ''
+  const params = new URLSearchParams()
+  if (q) params.set('q', q)
+  if (status) params.set('status', status)
+  try {
+    const r = await api('/admin/mail-logs?' + params.toString())
+    const items = r.items || []
+    if (!items.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="muted">Noch keine Mails versendet.</td></tr>'
+      return
+    }
+    tbody.innerHTML = items.map(m => {
+      const time = new Date(m.sent_at).toLocaleString('de-DE')
+      const statusBadge = m.status === 'sent'
+        ? '<span style="color:#3FE07A">✓ ok</span>'
+        : '<span style="color:#FF6B6B">✗ fail</span>'
+      const err = m.error_message ? '<span style="color:rgba(255,107,107,0.85);font-size:11px">' + esc(m.error_message.slice(0, 80)) + '</span>' : ''
+      return '<tr>'
+        + '<td style="font-size:11px">' + time + '</td>'
+        + '<td>' + esc(m.to_email) + (m.to_name ? ' <span class="muted">(' + esc(m.to_name) + ')</span>' : '') + '</td>'
+        + '<td>' + esc(m.subject ?? '—') + '</td>'
+        + '<td><code style="font-size:11px">' + esc(m.template_key ?? '—') + '</code></td>'
+        + '<td>' + statusBadge + '</td>'
+        + '<td>' + err + '</td>'
+        + '</tr>'
+    }).join('')
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="6" class="err">Fehler: ' + esc(e.message) + '</td></tr>'
+  }
+}
+
+// Debounced search re-trigger
+document.addEventListener('input', e => {
+  if (e.target?.id === 'mailLogSearch') {
+    clearTimeout(window._mailLogTimer)
+    window._mailLogTimer = setTimeout(loadMailLogs, 300)
+  }
+  if (e.target?.id === 'mailLogStatus') loadMailLogs()
+  if (e.target?.id === 'mailRecipSearch') filterRecipients()
+})
+
+// ── Vorlagen-Liste + Editor ─────────────────────────────────────────────
+async function loadMailTemplates() {
+  const list = document.getElementById('mailTemplatesList')
+  list.innerHTML = '<div class="loading">Lade Vorlagen…</div>'
+  try {
+    const r = await api('/admin/mail-templates')
+    list.innerHTML = (r.items || []).map(t => {
+      const badge = t.hasOverride
+        ? '<span style="background:rgba(63,224,122,0.2);color:#3FE07A;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600">ÜBERSCHRIEBEN</span>'
+        : '<span style="background:rgba(255,255,255,0.1);color:rgba(255,255,255,0.55);padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600">DEFAULT</span>'
+      const updated = t.updatedAt ? '<span class="muted" style="font-size:11px">zuletzt: ' + new Date(t.updatedAt).toLocaleString('de-DE') + '</span>' : ''
+      return '<div class="card" style="display:flex;align-items:center;gap:14px;padding:14px 16px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px">'
+        + '<div style="flex:1">'
+        +   '<div style="font-size:14px;font-weight:600">' + esc(t.name) + ' ' + badge + '</div>'
+        +   '<div class="muted" style="font-size:11px;margin-top:2px"><code>' + esc(t.key) + '</code> · Variablen: ' + esc(t.placeholders) + '</div>'
+        +   updated
+        + '</div>'
+        + '<button class="btn" onclick="openTemplateEditor(\\'' + esc(t.key) + '\\')">Bearbeiten</button>'
+        + '</div>'
+    }).join('')
+  } catch (e) {
+    list.innerHTML = '<div class="err">Fehler: ' + esc(e.message) + '</div>'
+  }
+}
+
+async function openTemplateEditor(key) {
+  try {
+    const t = await api('/admin/mail-templates/' + encodeURIComponent(key))
+    const cur = t.override || t.default
+    showTemplateModal(t, cur)
+  } catch (e) {
+    alert('Fehler: ' + e.message)
+  }
+}
+
+function showTemplateModal(t, cur) {
+  const wrap = document.getElementById('genericModal') || (() => {
+    const div = document.createElement('div')
+    div.id = 'genericModal'
+    div.className = 'modal'
+    document.body.appendChild(div)
+    return div
+  })()
+  wrap.innerHTML =
+    '<div class="modal-content" style="max-width:1100px;width:96vw;height:88vh;display:flex;flex-direction:column">'
+    + '<div class="modal-head"><h3>📝 ' + esc(t.name) + ' <code style="font-size:12px;color:rgba(255,255,255,0.4)">' + esc(t.key) + '</code></h3>'
+    +   '<button class="close" onclick="closeTemplateModal()">×</button>'
+    + '</div>'
+    + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;flex:1;overflow:hidden;padding:0 18px 18px">'
+    + '  <div style="display:flex;flex-direction:column;overflow:hidden">'
+    + '    <label class="lbl">Betreff</label>'
+    + '    <input type="text" id="tplSubject" style="margin:6px 0 12px" value="' + escAttr(cur.subject) + '">'
+    + '    <label class="lbl">HTML <span class="muted" style="font-weight:400">— Variablen: ' + esc(t.placeholders) + '</span></label>'
+    + '    <textarea id="tplHtml" style="flex:1;font-family:ui-monospace,monospace;font-size:11px;margin-top:6px">' + esc(cur.html) + '</textarea>'
+    + '    <label class="lbl" style="margin-top:10px">Plain-Text</label>'
+    + '    <textarea id="tplText" style="height:80px;font-family:ui-monospace,monospace;font-size:11px;margin-top:6px">' + esc(cur.text || '') + '</textarea>'
+    + '    <div style="display:flex;gap:8px;margin-top:12px">'
+    + '      <button class="btn" onclick="refreshTemplatePreview()">↻ Vorschau aktualisieren</button>'
+    + '      <button class="btn ok" onclick="saveTemplateEdit(\\'' + esc(t.key) + '\\')">Speichern</button>'
+    +        (cur === t.override ? '<button class="btn err" onclick="resetTemplate(\\'' + esc(t.key) + '\\')">Auf Default zurück</button>' : '')
+    + '    </div>'
+    + '    <div id="tplStatus" style="margin-top:8px;font-size:12px"></div>'
+    + '  </div>'
+    + '  <div style="display:flex;flex-direction:column;overflow:hidden">'
+    + '    <label class="lbl">Live-Vorschau (mit Test-Daten)</label>'
+    + '    <iframe id="tplPreview" style="flex:1;width:100%;border:1px solid rgba(255,255,255,0.08);border-radius:10px;background:#fff;margin-top:6px"></iframe>'
+    + '  </div>'
+    + '</div>'
+    + '</div>'
+  wrap.style.display = 'flex'
+  refreshTemplatePreview()
+}
+
+function closeTemplateModal() {
+  const m = document.getElementById('genericModal')
+  if (m) m.style.display = 'none'
+}
+
+async function refreshTemplatePreview() {
+  const iframe = document.getElementById('tplPreview')
+  const subject = document.getElementById('tplSubject').value
+  const html    = document.getElementById('tplHtml').value
+  const text    = document.getElementById('tplText').value
+  // POST an Backend → erhalten gefüllten Inhalt
+  // (Backend rendert Test-Daten in {{name}}, {{code}} etc.)
+  const wrap = '<!DOCTYPE html><html><head><style>body{margin:0;font-family:-apple-system,sans-serif}</style></head><body>' + html + '</body></html>'
+  // Einfacher Client-Fill — zeigt sofort, kein Server-Roundtrip nötig
+  const testVars = { name: 'Anna Müller', code: '123456', newEmail: 'neu@bsp.de', productName: 'Stempeluhr', price: '3,99 €/Monat', daysRemaining: '7', expiresAt: '2026-12-31', email: 'anna@beispiel.de' }
+  const filled = wrap.replace(/\\{\\{(\\w+)\\}\\}/g, (_, k) => testVars[k] ?? '')
+  iframe.srcdoc = filled
+  document.title = 'Vorschau: ' + (subject || '(kein Betreff)')
+}
+
+async function saveTemplateEdit(key) {
+  const subject = document.getElementById('tplSubject').value.trim()
+  const html    = document.getElementById('tplHtml').value
+  const text    = document.getElementById('tplText').value.trim()
+  const status = document.getElementById('tplStatus')
+  if (!subject || !html) { status.textContent = '❌ Betreff + HTML sind Pflicht.'; status.style.color='#FF6B6B'; return }
+  try {
+    await api('/admin/mail-templates/' + encodeURIComponent(key), { method: 'PUT', body: JSON.stringify({ subject, html, text }) })
+    status.textContent = '✅ Gespeichert.'
+    status.style.color = '#3FE07A'
+    loadMailTemplates()
+  } catch (e) {
+    status.textContent = '❌ ' + e.message
+    status.style.color = '#FF6B6B'
+  }
+}
+
+async function resetTemplate(key) {
+  if (!confirm('Override löschen — Default-Vorlage greift wieder?')) return
+  try {
+    await api('/admin/mail-templates/' + encodeURIComponent(key), { method: 'DELETE' })
+    closeTemplateModal()
+    loadMailTemplates()
+  } catch (e) { alert(e.message) }
+}
+
+// Live-Refresh-Vorschau bei Tipp-Änderung
+document.addEventListener('input', e => {
+  if (['tplSubject','tplHtml','tplText'].includes(e.target?.id)) {
+    clearTimeout(window._tplTimer)
+    window._tplTimer = setTimeout(refreshTemplatePreview, 250)
+  }
+  if (['mailHtml','mailSubject','mailText'].includes(e.target?.id)) {
+    clearTimeout(window._composeTimer)
+    window._composeTimer = setTimeout(previewCompose, 350)
+  }
+})
+
+// ── Compose / Manueller Versand ─────────────────────────────────────────
+async function loadComposeRecipients() {
+  if (emailUsersCache.length) { renderRecipients(emailUsersCache); return }
+  const list = document.getElementById('mailRecipList')
+  list.innerHTML = '<div class="loading">Lade Nutzer…</div>'
+  try {
+    const r = await api('/admin/users?limit=500')
+    emailUsersCache = (r.items || []).filter(u => u.email)
+    renderRecipients(emailUsersCache)
+  } catch (e) {
+    list.innerHTML = '<div class="err">Fehler: ' + esc(e.message) + '</div>'
+  }
+}
+
+function filterRecipients() {
+  const q = document.getElementById('mailRecipSearch').value.toLowerCase().trim()
+  const filtered = q
+    ? emailUsersCache.filter(u =>
+        (u.email || '').toLowerCase().includes(q) ||
+        (u.displayName || '').toLowerCase().includes(q))
+    : emailUsersCache
+  renderRecipients(filtered)
+}
+
+function renderRecipients(users) {
+  const list = document.getElementById('mailRecipList')
+  list.innerHTML = users.map(u => {
+    const checked = emailSelectedIds.has(u.id) ? 'checked' : ''
+    return '<label style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;cursor:pointer">'
+      + '<input type="checkbox" data-uid="' + esc(u.id) + '" ' + checked + ' onchange="toggleRecip(this)">'
+      + '<div style="flex:1;min-width:0">'
+      +   '<div style="font-size:13px;font-weight:500">' + esc(u.displayName || u.email) + '</div>'
+      +   '<div class="muted" style="font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(u.email) + '</div>'
+      + '</div></label>'
+  }).join('') || '<div class="muted" style="padding:14px;text-align:center">Keine Nutzer gefunden.</div>'
+  updateRecipCount()
+}
+
+function toggleRecip(el) {
+  if (el.checked) emailSelectedIds.add(el.dataset.uid)
+  else emailSelectedIds.delete(el.dataset.uid)
+  updateRecipCount()
+}
+
+function updateRecipCount() {
+  const el = document.getElementById('mailRecipSelected')
+  if (el) el.textContent = emailSelectedIds.size
+}
+
+function previewCompose() {
+  const iframe = document.getElementById('mailComposePreview')
+  if (!iframe) return
+  const html = document.getElementById('mailHtml').value
+  const wrap = '<!DOCTYPE html><html><head><style>body{margin:0;font-family:-apple-system,sans-serif}</style></head><body>' + html + '</body></html>'
+  const testVars = { name: 'Anna Müller', email: 'anna@beispiel.de' }
+  const filled = wrap.replace(/\\{\\{(\\w+)\\}\\}/g, (_, k) => testVars[k] ?? '')
+  iframe.srcdoc = filled
+}
+
+async function sendCompose() {
+  const subject = document.getElementById('mailSubject').value.trim()
+  const html    = document.getElementById('mailHtml').value.trim()
+  const text    = document.getElementById('mailText').value.trim()
+  const status  = document.getElementById('mailComposeStatus')
+  status.textContent = ''
+  if (!subject || !html) { status.innerHTML = '<span class="err">Betreff und HTML sind Pflicht.</span>'; return }
+  if (!emailSelectedIds.size) { status.innerHTML = '<span class="err">Mindestens einen Empfänger wählen.</span>'; return }
+  if (!confirm('Email an ' + emailSelectedIds.size + ' Nutzer schicken?')) return
+  status.innerHTML = '<span class="muted">Sende…</span>'
+  try {
+    const r = await api('/admin/mail-send', { method: 'POST', body: JSON.stringify({
+      userIds: Array.from(emailSelectedIds),
+      subject, html, text: text || undefined,
+    })})
+    status.innerHTML = '<span class="ok">✅ ' + r.sent + ' versendet'
+      + (r.failed ? ', <span class="err">' + r.failed + ' fehlgeschlagen</span>' : '')
+      + ' (gesamt ' + r.total + ')</span>'
+  } catch (e) {
+    status.innerHTML = '<span class="err">❌ ' + esc(e.message) + '</span>'
+  }
+}
+
+// ── Helpers (escapen) ────────────────────────────────────────────────
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]))
+}
+function escAttr(s) {
+  return esc(s).replace(/\\n/g, '&#10;')
+}
 
 // ── Staff & SuperAdmin ──────────────────────────────────────────────
 async function loadStaff() {
