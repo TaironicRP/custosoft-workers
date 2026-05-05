@@ -237,6 +237,18 @@ npm run deploy                # Push zu Cloudflare Workers
                               # Live in ~12 Sekunden auf 300+ PoPs
 ```
 
+---
+
+## Lokalisierung der Public Website
+
+Die Marketing-Seite (`/`), Impressum, Datenschutz, AGB, Widerruf und die
+Bewerbungs-Apply-Page sind mehrsprachig. Aktuell **Deutsch + Englisch**.
+
+URL-Schema: `/:locale/...` — z.B. `/en/`, `/de/imprint`, `/en/privacy`.
+Footer enthält einen Sprachschalter, der einen Cookie setzt.
+
+**Neue Sprache hinzufügen** (FR, ES, IT, …): siehe [`I18N.md`](I18N.md).
+
 **Custom Domain** (optional): in Cloudflare Dashboard → Workers → custosoft-api → Domains → `api.custosoft.de` hinzufügen.
 
 ---
