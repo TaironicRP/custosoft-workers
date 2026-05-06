@@ -148,6 +148,9 @@ const ADMIN_HTML = `<!DOCTYPE html>
         <a data-tab="orders">💳 <span>Bestellungen</span></a>
         <a data-tab="notifications">🔔 <span>Benachrichtigungen</span></a>
         <a data-tab="emails">📧 <span>E-Mails</span></a>
+        <a data-tab="bugs">🐛 <span>Bug-Tracker</span></a>
+        <a data-tab="roadmap">🗺️ <span>Roadmap</span></a>
+        <a data-tab="patchnotes">📋 <span>Patch-Notes</span></a>
         <a data-tab="legal">📜 <span>Rechtstexte</span></a>
         <a data-tab="staff">🛡️ <span>Staff &amp; SuperAdmin</span></a>
       </nav>
@@ -231,6 +234,50 @@ const ADMIN_HTML = `<!DOCTYPE html>
           <thead><tr><th>Empfänger</th><th>Titel</th><th>Inhalt</th><th>Typ</th><th>Datum</th></tr></thead>
           <tbody id="notifBody"></tbody>
         </table></div>
+      </section>
+
+      <!-- BUGS -->
+      <section data-section="bugs" style="display:none">
+        <h2>Bug-Tracker <span class="count" id="bugsCount"></span></h2>
+        <p class="sub">User-Reports aus iOS, Mac & Webapp · 50 MB Upload-Limit pro Datei</p>
+        <div class="toolbar" style="margin-bottom:12px">
+          <select id="bugFilterStatus">
+            <option value="all">Alle Status</option>
+            <option value="new" selected>Neu</option>
+            <option value="investigating">In Untersuchung</option>
+            <option value="fixed">Gefixt</option>
+            <option value="wontfix">Nicht behoben</option>
+            <option value="duplicate">Duplikat</option>
+          </select>
+          <button class="btn" onclick="loadBugs()">↻ Aktualisieren</button>
+        </div>
+        <div class="table-wrap"><table>
+          <thead><tr>
+            <th>Sev</th><th>Titel</th><th>User</th><th>Plattform</th>
+            <th>Erhalten</th><th>Status</th><th></th>
+          </tr></thead>
+          <tbody id="bugsBody"></tbody>
+        </table></div>
+      </section>
+
+      <!-- ROADMAP -->
+      <section data-section="roadmap" style="display:none">
+        <h2>Roadmap-Editor</h2>
+        <p class="sub">Wird live auf der Landing-Page angezeigt (custosoft-webapp.pages.dev)</p>
+        <div class="toolbar" style="margin-bottom:12px">
+          <button class="btn ok" onclick="openRoadmapEdit()">+ Neuer Eintrag</button>
+        </div>
+        <div id="roadmapList" style="display:flex;flex-direction:column;gap:10px"></div>
+      </section>
+
+      <!-- PATCH NOTES -->
+      <section data-section="patchnotes" style="display:none">
+        <h2>Patch-Notes</h2>
+        <p class="sub">Versions-Notes — werden in der App und auf der Webseite angezeigt</p>
+        <div class="toolbar" style="margin-bottom:12px">
+          <button class="btn ok" onclick="openPatchNoteEdit()">+ Neue Patch-Note</button>
+        </div>
+        <div id="patchNotesList" style="display:flex;flex-direction:column;gap:10px"></div>
       </section>
 
       <!-- LEGAL -->
@@ -475,6 +522,9 @@ document.querySelectorAll('.sidebar nav a').forEach(a => {
     else if (tab === 'orders')   loadOrders()
     else if (tab === 'notifications') loadNotifications()
     else if (tab === 'emails')   onEmailsTabOpen()
+    else if (tab === 'bugs')        loadBugs()
+    else if (tab === 'roadmap')     loadRoadmap()
+    else if (tab === 'patchnotes')  loadPatchNotes()
     else if (tab === 'legal')    loadLegal()
     else if (tab === 'staff')    loadStaff()
   })
@@ -773,6 +823,354 @@ function esc(s) {
 }
 function escAttr(s) {
   return esc(s).replace(/\\n/g, '&#10;')
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// BUG-TRACKER
+// ════════════════════════════════════════════════════════════════════════
+const SEV_COLORS = { critical: '#FF3B30', high: '#FF9500', medium: '#FFCC00', low: '#8E8E93' }
+const STATUS_LABEL = { new: 'NEU', investigating: 'IN UNTERSUCHUNG', fixed: 'GEFIXT', wontfix: 'NICHT BEHOBEN', duplicate: 'DUPLIKAT' }
+
+async function loadBugs() {
+  const tbody = document.getElementById('bugsBody')
+  tbody.innerHTML = '<tr><td colspan="7" class="loading">Lade…</td></tr>'
+  const status = document.getElementById('bugFilterStatus')?.value ?? 'new'
+  try {
+    const r = await api('/admin/bugs?status=' + status)
+    const items = r.items || []
+    document.getElementById('bugsCount').textContent = items.length
+    if (!items.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="muted">Keine Reports in diesem Filter.</td></tr>'
+      return
+    }
+    tbody.innerHTML = items.map(b => {
+      const time = new Date(b.created_at).toLocaleString('de-DE')
+      const sev = (b.severity || 'medium').toLowerCase()
+      const att = (b.attachments?.length ?? 0)
+      return '<tr>'
+        + '<td><span style="background:' + SEV_COLORS[sev] + '22;color:' + SEV_COLORS[sev] + ';font-size:10px;font-weight:700;padding:3px 8px;border-radius:4px">' + sev.toUpperCase() + '</span></td>'
+        + '<td><strong>' + esc(b.title) + '</strong>' + (att ? ' <span class="muted" style="font-size:11px">📎' + att + '</span>' : '') + '</td>'
+        + '<td>' + esc(b.user_name || b.user_email || '—') + '</td>'
+        + '<td>' + esc(b.platform || '—') + (b.app_version ? ' <span class="muted">v' + esc(b.app_version) + '</span>' : '') + '</td>'
+        + '<td style="font-size:11px">' + time + '</td>'
+        + '<td>' + (STATUS_LABEL[b.status] || b.status) + '</td>'
+        + '<td><button class="btn" onclick="openBugDetail(' + b.id + ')">Details</button></td>'
+        + '</tr>'
+    }).join('')
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="7" class="err">Fehler: ' + esc(e.message) + '</td></tr>'
+  }
+}
+
+async function openBugDetail(id) {
+  try {
+    const b = await api('/admin/bugs/' + id)
+    const att = b.attachments || []
+    const wrap = document.getElementById('genericModal') || (() => {
+      const div = document.createElement('div')
+      div.id = 'genericModal'
+      div.className = 'modal'
+      document.body.appendChild(div)
+      return div
+    })()
+    const sev = (b.severity || 'medium').toLowerCase()
+    wrap.innerHTML =
+      '<div class="modal-content" style="max-width:800px">'
+      + '<div class="modal-head"><h3>🐛 Bug #' + b.id + ': ' + esc(b.title) + '</h3>'
+      +   '<button class="close" onclick="closeBugModal()">×</button></div>'
+      + '<div style="padding:0 18px 18px">'
+      + '  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px">'
+      + '    <div><div class="muted" style="font-size:10px;font-weight:700;letter-spacing:1px">SEV</div><div><span style="background:' + SEV_COLORS[sev] + '22;color:' + SEV_COLORS[sev] + ';font-size:11px;font-weight:700;padding:3px 8px;border-radius:4px">' + sev.toUpperCase() + '</span></div></div>'
+      + '    <div><div class="muted" style="font-size:10px;font-weight:700;letter-spacing:1px">PLATTFORM</div><div>' + esc(b.platform || '—') + (b.app_version ? ' v' + esc(b.app_version) : '') + '</div></div>'
+      + '    <div><div class="muted" style="font-size:10px;font-weight:700;letter-spacing:1px">USER</div><div>' + esc(b.user_name || '—') + '<br><span class="muted" style="font-size:11px">' + esc(b.user_email || '') + '</span></div></div>'
+      + '    <div><div class="muted" style="font-size:10px;font-weight:700;letter-spacing:1px">ERHALTEN</div><div>' + new Date(b.created_at).toLocaleString('de-DE') + '</div></div>'
+      + '  </div>'
+      + '  <label class="lbl">Beschreibung</label>'
+      + '  <div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:14px;font-size:13px;line-height:1.6;white-space:pre-wrap;margin:6px 0 14px">' + esc(b.description || '— keine Beschreibung —') + '</div>'
+      + (att.length ? '<label class="lbl">Anhänge (' + att.length + ')</label>'
+          + '<div style="display:flex;flex-direction:column;gap:6px;margin:6px 0 14px">'
+          + att.map(a => {
+              const isImg = /^image\//.test(a.type || '')
+              const isVid = /^video\//.test(a.type || '')
+              const url = a.url.startsWith('http') ? a.url : 'https://custosoft-api.davidschroedinger.workers.dev' + a.url
+              if (isImg) return '<div style="display:flex;align-items:center;gap:10px"><img src="' + esc(url) + '" style="max-width:120px;max-height:80px;border-radius:6px;object-fit:cover"><a href="' + esc(url) + '" target="_blank" style="color:#6abef8">' + esc(a.name) + '</a><span class="muted" style="font-size:11px">' + (a.bytes/1024).toFixed(0) + ' KB</span></div>'
+              if (isVid) return '<div><video controls src="' + esc(url) + '" style="max-width:240px;max-height:160px;border-radius:6px"></video><br><a href="' + esc(url) + '" target="_blank" style="color:#6abef8">' + esc(a.name) + '</a></div>'
+              return '<a href="' + esc(url) + '" target="_blank" style="color:#6abef8;display:flex;align-items:center;gap:8px"><span>📎</span>' + esc(a.name) + '<span class="muted" style="font-size:11px">' + (a.bytes/1024).toFixed(0) + ' KB</span></a>'
+            }).join('')
+          + '</div>' : '')
+      + '  <label class="lbl">Interne Notiz (nur Admin)</label>'
+      + '  <textarea id="bugNote" rows="3" style="margin:6px 0 14px">' + esc(b.internal_note || '') + '</textarea>'
+      + '  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
+      + '    <select id="bugStatus" style="flex:1;min-width:160px">'
+      +        Object.entries(STATUS_LABEL).map(([v,l]) => '<option value="' + v + '"' + (b.status === v ? ' selected' : '') + '>' + l + '</option>').join('')
+      + '    </select>'
+      + '    <button class="btn ok" onclick="saveBug(' + b.id + ')">Speichern</button>'
+      + '    <button class="btn err" onclick="deleteBug(' + b.id + ')">Löschen</button>'
+      + '  </div>'
+      + '</div></div>'
+    wrap.style.display = 'flex'
+  } catch (e) { alert(e.message) }
+}
+
+function closeBugModal() {
+  const m = document.getElementById('genericModal'); if (m) m.style.display = 'none'
+}
+
+async function saveBug(id) {
+  const status = document.getElementById('bugStatus').value
+  const note   = document.getElementById('bugNote').value
+  try {
+    await api('/admin/bugs/' + id, { method: 'PUT', body: JSON.stringify({ status, internal_note: note }) })
+    closeBugModal()
+    loadBugs()
+  } catch (e) { alert(e.message) }
+}
+
+async function deleteBug(id) {
+  if (!confirm('Bug #' + id + ' wirklich löschen?')) return
+  try {
+    await api('/admin/bugs/' + id, { method: 'DELETE' })
+    closeBugModal(); loadBugs()
+  } catch (e) { alert(e.message) }
+}
+
+document.addEventListener('change', e => {
+  if (e.target?.id === 'bugFilterStatus') loadBugs()
+})
+
+// ════════════════════════════════════════════════════════════════════════
+// ROADMAP-EDITOR
+// ════════════════════════════════════════════════════════════════════════
+const RM_STATUS = { done: '✓ LIVE', now: '▶ JETZT', next: '→ NÄCHSTES', later: '… GEPLANT' }
+const RM_COLORS = { done: '#3FE07A', now: '#8a44ee', next: '#3a62ff', later: 'rgba(255,255,255,0.4)' }
+
+async function loadRoadmap() {
+  const list = document.getElementById('roadmapList')
+  list.innerHTML = '<div class="loading">Lade…</div>'
+  try {
+    const r = await api('/admin/roadmap')
+    const items = r.items || []
+    if (!items.length) {
+      list.innerHTML = '<div class="muted" style="text-align:center;padding:30px">Keine Einträge — leg den ersten an.</div>'
+      return
+    }
+    list.innerHTML = items.map(i => {
+      const visBadge = i.is_public
+        ? '<span style="background:rgba(63,224,122,0.15);color:#3FE07A;font-size:10px;padding:2px 6px;border-radius:3px">PUBLIC</span>'
+        : '<span style="background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.5);font-size:10px;padding:2px 6px;border-radius:3px">VERSTECKT</span>'
+      return '<div style="display:flex;align-items:center;gap:14px;padding:14px 16px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px">'
+        + '  <div style="width:8px;height:8px;border-radius:50%;background:' + RM_COLORS[i.status] + ';flex-shrink:0"></div>'
+        + '  <div style="flex:1;min-width:0">'
+        + '    <div style="font-size:11px;font-weight:700;letter-spacing:0.5px;color:rgba(255,255,255,0.4);margin-bottom:2px">'
+        +        esc(i.quarter || '') + ' · ' + (RM_STATUS[i.status] || i.status) + ' · ' + visBadge
+        + '    </div>'
+        + '    <div style="font-size:14px;font-weight:600">' + esc(i.title) + '</div>'
+        + '    <div class="muted" style="font-size:12px;margin-top:2px">' + esc(i.description || '') + '</div>'
+        + '  </div>'
+        + '  <button class="btn" onclick=\'openRoadmapEdit(' + JSON.stringify(i).replace(/\'/g, '&#39;') + ')\'>Bearbeiten</button>'
+        + '  <button class="btn err" onclick="deleteRoadmap(' + i.id + ')">Löschen</button>'
+        + '</div>'
+    }).join('')
+  } catch (e) {
+    list.innerHTML = '<div class="err">Fehler: ' + esc(e.message) + '</div>'
+  }
+}
+
+function openRoadmapEdit(item) {
+  const isNew = !item
+  const i = item || { quarter: '', title: '', description: '', status: 'later', sort_order: 100, is_public: 1 }
+  const wrap = document.getElementById('genericModal') || (() => {
+    const div = document.createElement('div'); div.id = 'genericModal'; div.className = 'modal'; document.body.appendChild(div); return div
+  })()
+  wrap.innerHTML =
+    '<div class="modal-content" style="max-width:560px">'
+    + '<div class="modal-head"><h3>' + (isNew ? '+ Neuer Roadmap-Eintrag' : '✏️ Roadmap bearbeiten') + '</h3>'
+    +   '<button class="close" onclick="closeBugModal()">×</button></div>'
+    + '<div style="padding:0 18px 18px">'
+    + '  <div style="display:grid;grid-template-columns:1fr 2fr;gap:10px;margin-bottom:10px">'
+    + '    <div><label class="lbl">Zeitraum-Label</label><input id="rmQuarter" type="text" value="' + escAttr(i.quarter) + '" placeholder="z.B. Q3 2026, Live, Vision"></div>'
+    + '    <div><label class="lbl">Titel</label><input id="rmTitle" type="text" value="' + escAttr(i.title) + '" placeholder="Feature-Name"></div>'
+    + '  </div>'
+    + '  <label class="lbl">Beschreibung</label>'
+    + '  <textarea id="rmDescription" rows="3" placeholder="Worum geht\'s …">' + esc(i.description || '') + '</textarea>'
+    + '  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px">'
+    + '    <div><label class="lbl">Status</label>'
+    + '      <select id="rmStatus">'
+    +          Object.entries(RM_STATUS).map(([v,l]) => '<option value="' + v + '"' + (i.status === v ? ' selected' : '') + '>' + l + '</option>').join('')
+    + '      </select></div>'
+    + '    <div><label class="lbl">Reihenfolge</label><input id="rmSort" type="number" value="' + (i.sort_order ?? 100) + '"></div>'
+    + '    <div><label class="lbl">Sichtbar</label>'
+    + '      <select id="rmPublic">'
+    + '        <option value="1"' + (i.is_public ? ' selected' : '') + '>Public</option>'
+    + '        <option value="0"' + (!i.is_public ? ' selected' : '') + '>Versteckt</option>'
+    + '      </select></div>'
+    + '  </div>'
+    + '  <div style="display:flex;gap:10px;margin-top:18px">'
+    + '    <button class="btn ok" onclick="saveRoadmap(' + (i.id || 'null') + ')">Speichern</button>'
+    + '    <button class="btn" onclick="closeBugModal()">Abbrechen</button>'
+    + '  </div>'
+    + '</div></div>'
+  wrap.style.display = 'flex'
+}
+
+async function saveRoadmap(id) {
+  const body = {
+    quarter:     document.getElementById('rmQuarter').value.trim(),
+    title:       document.getElementById('rmTitle').value.trim(),
+    description: document.getElementById('rmDescription').value.trim(),
+    status:      document.getElementById('rmStatus').value,
+    sort_order:  parseInt(document.getElementById('rmSort').value) || 100,
+    is_public:   document.getElementById('rmPublic').value === '1',
+  }
+  if (!body.title) { alert('Titel ist Pflicht.'); return }
+  try {
+    if (id && id !== 'null') {
+      await api('/admin/roadmap/' + id, { method: 'PUT', body: JSON.stringify(body) })
+    } else {
+      await api('/admin/roadmap', { method: 'POST', body: JSON.stringify(body) })
+    }
+    closeBugModal(); loadRoadmap()
+  } catch (e) { alert(e.message) }
+}
+
+async function deleteRoadmap(id) {
+  if (!confirm('Eintrag wirklich löschen?')) return
+  try {
+    await api('/admin/roadmap/' + id, { method: 'DELETE' })
+    loadRoadmap()
+  } catch (e) { alert(e.message) }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// PATCH-NOTES
+// ════════════════════════════════════════════════════════════════════════
+async function loadPatchNotes() {
+  const list = document.getElementById('patchNotesList')
+  list.innerHTML = '<div class="loading">Lade…</div>'
+  try {
+    const r = await api('/admin/patch-notes')
+    const items = r.items || []
+    if (!items.length) {
+      list.innerHTML = '<div class="muted" style="text-align:center;padding:30px">Noch keine Patch-Notes.</div>'
+      return
+    }
+    list.innerHTML = items.map(p => {
+      const date = p.released_at ? new Date(p.released_at).toLocaleDateString('de-DE') : 'Entwurf'
+      const visBadge = p.is_published
+        ? '<span style="background:rgba(63,224,122,0.15);color:#3FE07A;font-size:10px;padding:2px 6px;border-radius:3px">VERÖFFENTLICHT</span>'
+        : '<span style="background:rgba(255,179,0,0.15);color:#FFB300;font-size:10px;padding:2px 6px;border-radius:3px">ENTWURF</span>'
+      return '<div style="padding:14px 16px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px">'
+        + '  <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">'
+        + '    <span style="font-size:18px;font-weight:700">v' + esc(p.version) + '</span>'
+        + '    <span class="muted" style="font-size:12px">' + date + '</span>'
+        + '    <span class="muted" style="font-size:11px;background:rgba(255,255,255,0.06);padding:2px 6px;border-radius:3px">' + esc(p.platform) + '</span>'
+        + '    ' + visBadge
+        + '    <span style="margin-left:auto"></span>'
+        + '    <button class="btn" onclick=\'openPatchNoteEdit(' + JSON.stringify(p).replace(/\'/g, '&#39;') + ')\'>Bearbeiten</button>'
+        + '    <button class="btn err" onclick="deletePatchNote(' + p.id + ')">Löschen</button>'
+        + '  </div>'
+        + (p.title ? '<div style="font-weight:600;font-size:14px">' + esc(p.title) + '</div>' : '')
+        + '  <div style="margin-top:8px;padding:12px;background:rgba(0,0,0,0.25);border-radius:8px;font-size:13px;line-height:1.6;color:rgba(255,255,255,0.8);max-height:140px;overflow:auto">'
+        +   (p.body_html || '<span class="muted">— kein Inhalt —</span>')
+        + '  </div>'
+        + '</div>'
+    }).join('')
+  } catch (e) {
+    list.innerHTML = '<div class="err">Fehler: ' + esc(e.message) + '</div>'
+  }
+}
+
+function openPatchNoteEdit(note) {
+  const isNew = !note
+  const n = note || { version: '', title: '', body_html: '', platform: 'all', released_at: new Date().toISOString().slice(0,10), is_published: 1, sort_order: 100 }
+  const wrap = document.getElementById('genericModal') || (() => {
+    const div = document.createElement('div'); div.id = 'genericModal'; div.className = 'modal'; document.body.appendChild(div); return div
+  })()
+  wrap.innerHTML =
+    '<div class="modal-content" style="max-width:880px;height:80vh;display:flex;flex-direction:column">'
+    + '<div class="modal-head"><h3>' + (isNew ? '+ Neue Patch-Note' : '✏️ Patch-Note v' + esc(n.version)) + '</h3>'
+    +   '<button class="close" onclick="closeBugModal()">×</button></div>'
+    + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;flex:1;overflow:hidden;padding:0 18px 18px">'
+    + '  <div style="display:flex;flex-direction:column;overflow:hidden">'
+    + '    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">'
+    + '      <div><label class="lbl">Version</label><input id="pnVersion" type="text" value="' + escAttr(n.version) + '" placeholder="1.7"></div>'
+    + '      <div><label class="lbl">Plattform</label><select id="pnPlatform">'
+    + '        <option value="all"' + (n.platform === 'all' ? ' selected' : '') + '>Alle</option>'
+    + '        <option value="ios"' + (n.platform === 'ios' ? ' selected' : '') + '>iOS</option>'
+    + '        <option value="mac"' + (n.platform === 'mac' ? ' selected' : '') + '>Mac</option>'
+    + '        <option value="web"' + (n.platform === 'web' ? ' selected' : '') + '>Web</option>'
+    + '      </select></div>'
+    + '      <div><label class="lbl">Status</label><select id="pnPublished">'
+    + '        <option value="1"' + (n.is_published ? ' selected' : '') + '>Veröffentlicht</option>'
+    + '        <option value="0"' + (!n.is_published ? ' selected' : '') + '>Entwurf</option>'
+    + '      </select></div>'
+    + '    </div>'
+    + '    <label class="lbl" style="margin-top:10px">Titel (optional)</label>'
+    + '    <input id="pnTitle" type="text" value="' + escAttr(n.title || '') + '" placeholder="Was ist neu in dieser Version?">'
+    + '    <label class="lbl" style="margin-top:10px">Datum</label>'
+    + '    <input id="pnReleased" type="date" value="' + (n.released_at ? n.released_at.slice(0,10) : '') + '">'
+    + '    <label class="lbl" style="margin-top:10px">HTML-Body <span class="muted" style="font-weight:400">(z.B. &lt;ul&gt;&lt;li&gt;…&lt;/li&gt;&lt;/ul&gt;)</span></label>'
+    + '    <textarea id="pnHtml" style="flex:1;font-family:ui-monospace,monospace;font-size:12px;margin-top:6px">' + esc(n.body_html || '') + '</textarea>'
+    + '    <div style="display:flex;gap:10px;margin-top:12px">'
+    + '      <button class="btn ok" onclick="savePatchNote(' + (n.id || 'null') + ')">Speichern</button>'
+    + '      <button class="btn" onclick="refreshPatchNotePreview()">↻ Vorschau</button>'
+    + '    </div>'
+    + '  </div>'
+    + '  <div style="display:flex;flex-direction:column;overflow:hidden">'
+    + '    <label class="lbl">Live-Vorschau</label>'
+    + '    <iframe id="pnPreview" style="flex:1;width:100%;border:1px solid rgba(255,255,255,0.08);border-radius:10px;background:#fff;margin-top:6px"></iframe>'
+    + '  </div>'
+    + '</div></div>'
+  wrap.style.display = 'flex'
+  refreshPatchNotePreview()
+}
+
+function refreshPatchNotePreview() {
+  const iframe = document.getElementById('pnPreview')
+  if (!iframe) return
+  const title = document.getElementById('pnTitle')?.value || ''
+  const html  = document.getElementById('pnHtml')?.value || ''
+  const ver   = document.getElementById('pnVersion')?.value || ''
+  iframe.srcdoc = '<!DOCTYPE html><html><head><style>body{margin:0;padding:24px;font-family:-apple-system,sans-serif;background:#0a0a14;color:#fff;line-height:1.6}h2{margin:0 0 4px}.muted{color:rgba(255,255,255,0.5);font-size:13px;margin-bottom:16px}ul{padding-left:20px}li{margin:6px 0}</style></head><body>'
+    + '<h2>v' + ver + (title ? ' — ' + title : '') + '</h2>'
+    + '<div class="muted">CustoSoft</div>'
+    + html + '</body></html>'
+}
+
+document.addEventListener('input', e => {
+  if (['pnVersion','pnTitle','pnHtml'].includes(e.target?.id)) {
+    clearTimeout(window._pnTimer); window._pnTimer = setTimeout(refreshPatchNotePreview, 250)
+  }
+})
+
+async function savePatchNote(id) {
+  const body = {
+    version:      document.getElementById('pnVersion').value.trim(),
+    title:        document.getElementById('pnTitle').value.trim(),
+    body_html:    document.getElementById('pnHtml').value,
+    platform:     document.getElementById('pnPlatform').value,
+    released_at:  document.getElementById('pnReleased').value
+                    ? new Date(document.getElementById('pnReleased').value).toISOString()
+                    : null,
+    is_published: document.getElementById('pnPublished').value === '1',
+  }
+  if (!body.version) { alert('Version ist Pflicht.'); return }
+  try {
+    if (id && id !== 'null') {
+      await api('/admin/patch-notes/' + id, { method: 'PUT', body: JSON.stringify(body) })
+    } else {
+      await api('/admin/patch-notes', { method: 'POST', body: JSON.stringify(body) })
+    }
+    closeBugModal(); loadPatchNotes()
+  } catch (e) { alert(e.message) }
+}
+
+async function deletePatchNote(id) {
+  if (!confirm('Patch-Note wirklich löschen?')) return
+  try {
+    await api('/admin/patch-notes/' + id, { method: 'DELETE' })
+    loadPatchNotes()
+  } catch (e) { alert(e.message) }
 }
 
 // ── Staff & SuperAdmin ──────────────────────────────────────────────

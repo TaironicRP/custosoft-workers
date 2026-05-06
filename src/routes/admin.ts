@@ -1026,6 +1026,166 @@ function renderDefaultTemplate(key: string): { subject: string; html: string; te
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 10. Bug-Reports · Roadmap · Patch-Notes (CRUD)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Bug-Reports: Liste + Detail + Update ────────────────────────────────────
+admin.get('/bugs', async (c) => {
+  const status = c.req.query('status')
+  let q = `SELECT * FROM bug_reports WHERE 1=1`
+  const binds: any[] = []
+  if (status && status !== 'all') { q += ` AND status = ?`; binds.push(status) }
+  q += ` ORDER BY
+           CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+           created_at DESC LIMIT 200`
+  try {
+    const rows = await c.env.DB.prepare(q).bind(...binds).all<any>()
+    return c.json({
+      items: (rows.results ?? []).map((r: any) => ({
+        ...r,
+        attachments: r.attachments ? JSON.parse(r.attachments) : [],
+      })),
+    })
+  } catch {
+    return c.json({ items: [], note: 'bug_reports missing — run scripts/create_bug_roadmap_patchnotes.sql' })
+  }
+})
+
+admin.get('/bugs/:id', async (c) => {
+  const id = c.req.param('id')
+  const row = await c.env.DB.prepare(`SELECT * FROM bug_reports WHERE id = ?`).bind(id).first<any>()
+  if (!row) return c.json({ error: 'Nicht gefunden.' }, 404)
+  return c.json({
+    ...row,
+    attachments: row.attachments ? JSON.parse(row.attachments) : [],
+  })
+})
+
+admin.put('/bugs/:id', async (c) => {
+  const id = c.req.param('id')
+  const body = await c.req.json<{ status?: string; severity?: string; internal_note?: string }>()
+  const fields: string[] = []
+  const binds: any[] = []
+  if (body.status        !== undefined) { fields.push('status = ?');        binds.push(body.status) }
+  if (body.severity      !== undefined) { fields.push('severity = ?');      binds.push(body.severity) }
+  if (body.internal_note !== undefined) { fields.push('internal_note = ?'); binds.push(body.internal_note) }
+  if (!fields.length) return c.json({ error: 'Nichts zu aktualisieren.' }, 400)
+  fields.push(`updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')`)
+  binds.push(id)
+  await c.env.DB.prepare(
+    `UPDATE bug_reports SET ${fields.join(', ')} WHERE id = ?`
+  ).bind(...binds).run()
+  return c.json({ ok: true })
+})
+
+admin.delete('/bugs/:id', async (c) => {
+  await c.env.DB.prepare(`DELETE FROM bug_reports WHERE id = ?`).bind(c.req.param('id')).run()
+  return c.json({ ok: true })
+})
+
+// ── Roadmap-Items: List + CRUD ─────────────────────────────────────────────
+admin.get('/roadmap', async (c) => {
+  try {
+    const rows = await c.env.DB.prepare(
+      `SELECT * FROM roadmap_items ORDER BY sort_order ASC`
+    ).all<any>()
+    return c.json({ items: rows.results ?? [] })
+  } catch {
+    return c.json({ items: [] })
+  }
+})
+
+admin.post('/roadmap', async (c) => {
+  const body = await c.req.json<{
+    quarter?: string; title: string; description?: string;
+    status?: string; sort_order?: number; is_public?: boolean;
+  }>()
+  if (!body.title?.trim()) return c.json({ error: 'Titel ist Pflicht.' }, 400)
+  const r = await c.env.DB.prepare(
+    `INSERT INTO roadmap_items (quarter, title, description, status, sort_order, is_public)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).bind(
+    body.quarter ?? null, body.title.trim(), body.description ?? null,
+    body.status ?? 'later', body.sort_order ?? 100, body.is_public === false ? 0 : 1,
+  ).run()
+  return c.json({ ok: true, id: r.meta.last_row_id })
+})
+
+admin.put('/roadmap/:id', async (c) => {
+  const id = c.req.param('id')
+  const body = await c.req.json<any>()
+  const fields: string[] = []
+  const binds: any[] = []
+  for (const key of ['quarter', 'title', 'description', 'status', 'sort_order'] as const) {
+    if (body[key] !== undefined) { fields.push(`${key} = ?`); binds.push(body[key]) }
+  }
+  if (body.is_public !== undefined) { fields.push(`is_public = ?`); binds.push(body.is_public ? 1 : 0) }
+  if (!fields.length) return c.json({ error: 'Nichts zu aktualisieren.' }, 400)
+  fields.push(`updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')`)
+  binds.push(id)
+  await c.env.DB.prepare(`UPDATE roadmap_items SET ${fields.join(', ')} WHERE id = ?`).bind(...binds).run()
+  return c.json({ ok: true })
+})
+
+admin.delete('/roadmap/:id', async (c) => {
+  await c.env.DB.prepare(`DELETE FROM roadmap_items WHERE id = ?`).bind(c.req.param('id')).run()
+  return c.json({ ok: true })
+})
+
+// ── Patch-Notes: List + CRUD ───────────────────────────────────────────────
+admin.get('/patch-notes', async (c) => {
+  try {
+    const rows = await c.env.DB.prepare(
+      `SELECT * FROM patch_notes ORDER BY released_at DESC NULLS LAST, sort_order DESC, id DESC`
+    ).all<any>()
+    return c.json({ items: rows.results ?? [] })
+  } catch {
+    return c.json({ items: [] })
+  }
+})
+
+admin.post('/patch-notes', async (c) => {
+  const body = await c.req.json<{
+    version: string; title?: string; body_html?: string; body_markdown?: string;
+    platform?: string; released_at?: string; is_published?: boolean; sort_order?: number;
+  }>()
+  if (!body.version?.trim()) return c.json({ error: 'Version ist Pflicht.' }, 400)
+  const r = await c.env.DB.prepare(
+    `INSERT INTO patch_notes (version, title, body_html, body_markdown, platform,
+                              released_at, is_published, sort_order)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    body.version.trim(), body.title ?? null, body.body_html ?? '', body.body_markdown ?? null,
+    body.platform ?? 'all',
+    body.released_at ?? new Date().toISOString(),
+    body.is_published === false ? 0 : 1,
+    body.sort_order ?? 100,
+  ).run()
+  return c.json({ ok: true, id: r.meta.last_row_id })
+})
+
+admin.put('/patch-notes/:id', async (c) => {
+  const id = c.req.param('id')
+  const body = await c.req.json<any>()
+  const fields: string[] = []
+  const binds: any[] = []
+  for (const key of ['version','title','body_html','body_markdown','platform','released_at','sort_order'] as const) {
+    if (body[key] !== undefined) { fields.push(`${key} = ?`); binds.push(body[key]) }
+  }
+  if (body.is_published !== undefined) { fields.push(`is_published = ?`); binds.push(body.is_published ? 1 : 0) }
+  if (!fields.length) return c.json({ error: 'Nichts zu aktualisieren.' }, 400)
+  fields.push(`updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')`)
+  binds.push(id)
+  await c.env.DB.prepare(`UPDATE patch_notes SET ${fields.join(', ')} WHERE id = ?`).bind(...binds).run()
+  return c.json({ ok: true })
+})
+
+admin.delete('/patch-notes/:id', async (c) => {
+  await c.env.DB.prepare(`DELETE FROM patch_notes WHERE id = ?`).bind(c.req.param('id')).run()
+  return c.json({ ok: true })
+})
+
 admin.get('/beta-signups', async (c) => {
   const rows = await c.env.DB.prepare(
     `SELECT * FROM beta_signups ORDER BY created_at DESC`

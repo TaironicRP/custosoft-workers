@@ -23,6 +23,7 @@ import onboarding    from './routes/onboarding'
 import support       from './routes/support'
 import iap           from './routes/iap-notifications'
 import webAdmin      from './routes/web-admin'
+import bugs          from './routes/bugs'
 import webPublic     from './routes/web-public'
 import { runSubscriptionLifecycle } from './cron/subscriptionLifecycle'
 
@@ -84,6 +85,11 @@ v1.route('/notifications', notifications)
 v1.route('/onboarding',    onboarding)
 v1.route('/support',       support)
 v1.route('/iap',           iap)        // Apple App Store Server Notifications V2
+
+// Bug-Reports + dynamische Roadmap + Patch-Notes
+// Hängt direkt unter /api/v1 — Routes: /bugs, /bugs/upload, /bugs/mine,
+// /roadmap, /patch-notes
+v1.route('/',              bugs)
 
 app.route('/api/v1', v1)
 
