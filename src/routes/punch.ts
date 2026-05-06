@@ -717,4 +717,255 @@ punch.get('/team/:userId', async (c) => {
   return c.json((records.results ?? []).map(buildPunchRecord))
 })
 
+// ════════════════════════════════════════════════════════════════════════════
+//  ARCHIV — Stempelzeiten zurücksetzen + ältere Stände durchsehen
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Archiviert alle aktuellen punch_entries des Users und liefert die archive_id
+/// + Aggregate zurück. Wird sowohl aus dem User-Reset-Endpoint als auch aus
+/// den Org-Hooks (leave/remove/delete) benutzt.
+export async function archiveUserPunchEntries(
+  db:     D1Database,
+  userId: string,
+  reason: 'user_reset' | 'org_leave' | 'org_remove' | 'org_delete',
+  opts?:  { orgIdFilter?: number | null }
+): Promise<{ archiveId: number | null; total: number }> {
+  // User-Snapshot (Name/Email)
+  const u = await db.prepare(
+    `SELECT id, email, first_name, last_name FROM users WHERE id = ?`
+  ).bind(userId).first<{ id: string; email: string; first_name: string | null; last_name: string | null }>()
+
+  // Welche Records archivieren?
+  //  - user_reset: ALLE Records des Users (er hat keine aktive Org)
+  //  - org_*:      nur Records der org_id wenn opts.orgIdFilter gesetzt ist
+  let recordsQ =
+    `SELECT id, user_id, org_id, clock_in, clock_out, pause_seconds, note, is_manual
+     FROM punch_entries
+     WHERE user_id = ?`
+  const binds: any[] = [userId]
+  if (opts?.orgIdFilter != null) {
+    recordsQ += ' AND org_id = ?'
+    binds.push(opts.orgIdFilter)
+  }
+  recordsQ += ' ORDER BY clock_in ASC'
+
+  const rows = await db.prepare(recordsQ).bind(...binds).all<any>()
+  const records = rows.results ?? []
+  if (records.length === 0) return { archiveId: null, total: 0 }
+
+  // Org-Snapshot (Name) wenn org_id gesetzt
+  let orgId: number | null = null
+  let orgName: string | null = null
+  const orgIds = new Set<number>(records.map(r => r.org_id).filter((x: any) => x != null))
+  if (orgIds.size === 1) {
+    orgId = Array.from(orgIds)[0] as number
+    const o = await db.prepare(`SELECT name FROM organisations WHERE id = ?`).bind(orgId).first<{ name: string }>()
+    orgName = o?.name ?? null
+  } else if (opts?.orgIdFilter != null) {
+    orgId = opts.orgIdFilter
+    const o = await db.prepare(`SELECT name FROM organisations WHERE id = ?`).bind(orgId).first<{ name: string }>()
+    orgName = o?.name ?? null
+  }
+
+  // Aggregate berechnen
+  let totalSeconds  = 0
+  let totalPauseSec = 0
+  let firstIn:  string | null = null
+  let lastOut: string | null = null
+  for (const r of records) {
+    if (r.clock_out) {
+      const sec = Math.max(0, Math.floor(
+        (new Date(r.clock_out).getTime() - new Date(r.clock_in).getTime()) / 1000
+      ) - (r.pause_seconds ?? 0))
+      totalSeconds += sec
+    }
+    totalPauseSec += r.pause_seconds ?? 0
+    if (!firstIn || r.clock_in < firstIn) firstIn = r.clock_in
+    const finalOut = r.clock_out ?? r.clock_in
+    if (!lastOut || finalOut > lastOut) lastOut = finalOut
+  }
+
+  const displayName = (`${u?.first_name ?? ''} ${u?.last_name ?? ''}`.trim()) || u?.email || null
+
+  // Archiv-Header anlegen
+  const ins = await db.prepare(
+    `INSERT INTO punch_archives
+       (user_id, user_display_name, user_email, org_id, org_name, reason,
+        total_entries, total_seconds, total_pause_sec, range_from, range_to)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    userId, displayName, u?.email ?? null, orgId, orgName, reason,
+    records.length, totalSeconds, totalPauseSec, firstIn, lastOut,
+  ).run()
+  const archiveId = Number(ins.meta.last_row_id)
+
+  // Einträge kopieren — batch
+  const stmt = db.prepare(
+    `INSERT INTO punch_archive_entries
+       (archive_id, user_id, org_id, clock_in, clock_out, pause_seconds, note, is_manual)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+  const batch = records.map(r => stmt.bind(
+    archiveId, r.user_id, r.org_id, r.clock_in, r.clock_out,
+    r.pause_seconds ?? 0, r.note, r.is_manual ?? 0,
+  ))
+  await db.batch(batch)
+
+  // Originale + zugehörige Pausen löschen
+  const ids = records.map(r => r.id)
+  const placeholders = ids.map(() => '?').join(',')
+  await db.prepare(`DELETE FROM pause_entries WHERE punch_entry_id IN (${placeholders})`).bind(...ids).run()
+  await db.prepare(`DELETE FROM punch_entries     WHERE id IN (${placeholders})`).bind(...ids).run()
+
+  return { archiveId, total: records.length }
+}
+
+// POST /punch/reset — User-initiierter Reset (nur ohne aktive Org möglich)
+punch.post('/reset', async (c) => {
+  try {
+    const user = c.get('user')
+    const db = c.env.DB
+
+    // Hard-Gate: in Org → Reset verboten. Nur über Org-Verlassen.
+    const member = await db
+      .prepare('SELECT org_id FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1')
+      .bind(user.id).first<{ org_id: number }>()
+    if (member) {
+      return c.json({
+        error: 'In einer Organisation kannst du deine Stempeluhr nicht zurücksetzen. Verlasse erst die Organisation — deine Zeiten werden dann automatisch archiviert.',
+      }, 403)
+    }
+
+    // Falls noch eingestempelt: erst beenden
+    const open = await db.prepare(
+      `SELECT id FROM punch_entries WHERE user_id = ? AND clock_out IS NULL LIMIT 1`
+    ).bind(user.id).first<{ id: number }>()
+    if (open) {
+      await db.prepare(
+        `UPDATE punch_entries SET clock_out = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`
+      ).bind(open.id).run()
+    }
+
+    const result = await archiveUserPunchEntries(db, user.id, 'user_reset')
+    return c.json({
+      ok: true,
+      archiveId:    result.archiveId,
+      archivedCount: result.total,
+    })
+  } catch (e: any) {
+    console.error('[POST /punch/reset]', e?.message ?? e, e?.stack)
+    return c.json({ error: `Reset fehlgeschlagen: ${e?.message ?? 'unbekannt'}` }, 500)
+  }
+})
+
+// GET /punch/archives — eigene Archive-Liste
+punch.get('/archives', async (c) => {
+  const user = c.get('user')
+  const rows = await c.env.DB.prepare(
+    `SELECT * FROM punch_archives WHERE user_id = ? ORDER BY created_at DESC`
+  ).bind(user.id).all<any>()
+  return c.json({
+    items: (rows.results ?? []).map(buildArchiveDto),
+  })
+})
+
+// GET /punch/archives/:id — Detail (Header + Einträge)
+punch.get('/archives/:id', async (c) => {
+  const user = c.get('user')
+  const id = c.req.param('id')
+
+  const archive = await c.env.DB.prepare(
+    `SELECT * FROM punch_archives WHERE id = ? AND user_id = ?`
+  ).bind(id, user.id).first<any>()
+  if (!archive) return c.json({ error: 'Archiv nicht gefunden.' }, 404)
+
+  const entries = await c.env.DB.prepare(
+    `SELECT * FROM punch_archive_entries WHERE archive_id = ? ORDER BY clock_in ASC`
+  ).bind(id).all<any>()
+
+  return c.json({
+    ...buildArchiveDto(archive),
+    entries: (entries.results ?? []).map(buildArchiveEntryDto),
+  })
+})
+
+// ── Org-side: Owner sieht alle Archive seiner (auch ehemaligen) Mitglieder ─
+
+// GET /punch/team/archives — Listing aller Org-bezogenen Archive
+punch.get('/team/archives', async (c) => {
+  const user = c.get('user')
+  const me = await c.env.DB.prepare(
+    `SELECT org_id, role, can_view_salaries FROM org_members
+     WHERE user_id = ? AND is_active = 1 LIMIT 1`
+  ).bind(user.id).first<{ org_id: number; role: string; can_view_salaries: number }>()
+  if (!me) return c.json({ error: 'Nicht in einer Organisation.' }, 403)
+
+  const allowed = me.role === 'Owner' || me.role === 'Admin' || me.can_view_salaries === 1
+  if (!allowed) return c.json({ error: 'Keine Berechtigung.' }, 403)
+
+  const rows = await c.env.DB.prepare(
+    `SELECT * FROM punch_archives WHERE org_id = ? ORDER BY created_at DESC`
+  ).bind(me.org_id).all<any>()
+  return c.json({
+    items: (rows.results ?? []).map(buildArchiveDto),
+  })
+})
+
+// GET /punch/team/archives/:id — Detail (für Org)
+punch.get('/team/archives/:id', async (c) => {
+  const user = c.get('user')
+  const id = c.req.param('id')
+
+  const me = await c.env.DB.prepare(
+    `SELECT org_id, role, can_view_salaries FROM org_members
+     WHERE user_id = ? AND is_active = 1 LIMIT 1`
+  ).bind(user.id).first<{ org_id: number; role: string; can_view_salaries: number }>()
+  if (!me) return c.json({ error: 'Nicht in einer Organisation.' }, 403)
+
+  const allowed = me.role === 'Owner' || me.role === 'Admin' || me.can_view_salaries === 1
+  if (!allowed) return c.json({ error: 'Keine Berechtigung.' }, 403)
+
+  const archive = await c.env.DB.prepare(
+    `SELECT * FROM punch_archives WHERE id = ? AND org_id = ?`
+  ).bind(id, me.org_id).first<any>()
+  if (!archive) return c.json({ error: 'Archiv nicht gefunden.' }, 404)
+
+  const entries = await c.env.DB.prepare(
+    `SELECT * FROM punch_archive_entries WHERE archive_id = ? ORDER BY clock_in ASC`
+  ).bind(id).all<any>()
+
+  return c.json({
+    ...buildArchiveDto(archive),
+    entries: (entries.results ?? []).map(buildArchiveEntryDto),
+  })
+})
+
+function buildArchiveDto(row: any) {
+  return {
+    id:              row.id,
+    userId:          row.user_id,
+    userDisplayName: row.user_display_name,
+    userEmail:       row.user_email,
+    orgId:           row.org_id,
+    orgName:         row.org_name,
+    reason:          row.reason,
+    totalEntries:    row.total_entries,
+    totalSeconds:    row.total_seconds,
+    totalPauseSec:   row.total_pause_sec,
+    rangeFrom:       row.range_from,
+    rangeTo:         row.range_to,
+    createdAt:       row.created_at,
+  }
+}
+function buildArchiveEntryDto(row: any) {
+  return {
+    id:           row.id,
+    clockIn:      row.clock_in,
+    clockOut:     row.clock_out,
+    pauseSeconds: row.pause_seconds ?? 0,
+    note:         row.note,
+    isManual:     row.is_manual === 1,
+  }
+}
+
 export default punch

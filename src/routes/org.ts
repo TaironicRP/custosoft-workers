@@ -3,6 +3,7 @@ import { Hono }        from 'hono'
 import type { Env, AppEnv } from '../types'
 import { requireAuth } from '../middleware/auth'
 import { randomInviteCode } from '../utils/crypto'
+import { archiveUserPunchEntries } from './punch'
 import { sendEmail }   from '../utils/email'
 
 // ── Slot-System: max Mitglieder je Lizenz-Tier ───────────────────────────────
@@ -94,6 +95,24 @@ org.delete('/', requireAuth, async (c) => {
   await c.env.DB
     .prepare("UPDATE employee_files SET is_archived = 1, archived_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE org_id = ?")
     .bind(member.org_id).run()
+
+  // Stempelzeiten ALLER aktiven Mitglieder archivieren — die User behalten
+  // ihre Zeiten als persönliches Archiv auch nachdem die Org weg ist. Owner
+  // ebenfalls (sieht seine Zeiten dann unter den eigenen Archiven).
+  try {
+    const allMembers = await c.env.DB.prepare(
+      `SELECT user_id FROM org_members WHERE org_id = ? AND is_active = 1`
+    ).bind(member.org_id).all<{ user_id: string }>()
+    for (const m of (allMembers.results ?? [])) {
+      try {
+        await archiveUserPunchEntries(c.env.DB, m.user_id, 'org_delete', { orgIdFilter: member.org_id })
+      } catch (e: any) {
+        console.warn(`[org/delete] punch archive for ${m.user_id} failed:`, e?.message ?? e)
+      }
+    }
+  } catch (e: any) {
+    console.warn('[org/delete] punch archive bulk failed:', e?.message ?? e)
+  }
 
   // Cascade-Delete via Schema-Constraints (organisations → ON DELETE CASCADE)
   await c.env.DB
@@ -516,6 +535,15 @@ org.post('/leave', requireAuth, async (c) => {
     .prepare("UPDATE employee_files SET is_archived = 1, archived_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE subject_user_id = ? AND org_id = ?")
     .bind(userId, member.org_id).run()
 
+  // ── Stempelzeiten als Archiv konservieren ──────────────────────────────
+  // Sichtbar für den User UND die Org. Die User-eigene Stempeluhr fängt damit
+  // bei null wieder an (wenn er später neu beitritt oder wieder solo arbeitet).
+  try {
+    await archiveUserPunchEntries(c.env.DB, userId, 'org_leave', { orgIdFilter: member.org_id })
+  } catch (e: any) {
+    console.warn('[org/leave] punch archive failed:', e?.message ?? e)
+  }
+
   // SICHERHEIT: Aus allen Org-Conversations entfernen damit der User keine
   // Org-Chats mehr sieht nach dem Verlassen
   await c.env.DB
@@ -544,6 +572,14 @@ org.delete('/members/:uid', requireAuth, async (c) => {
   await c.env.DB
     .prepare("UPDATE employee_files SET is_archived = 1, archived_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE subject_user_id = ? AND org_id = ?")
     .bind(targetId, myMember.org_id).run()
+
+  // Stempelzeiten des entfernten Users archivieren — bleibt für Org sichtbar
+  // (Lohnabschluss-relevant) UND für den Ex-User in seinem Profil-Archiv.
+  try {
+    await archiveUserPunchEntries(c.env.DB, targetId, 'org_remove', { orgIdFilter: myMember.org_id })
+  } catch (e: any) {
+    console.warn('[org/members/remove] punch archive failed:', e?.message ?? e)
+  }
 
   // SICHERHEIT: Aus allen Org-Conversations entfernen
   await c.env.DB
