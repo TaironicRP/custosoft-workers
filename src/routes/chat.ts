@@ -20,8 +20,9 @@
 
 import { Hono } from 'hono'
 import { requireAuth } from '../middleware/auth'
-import type { AppEnv } from '../types'
+import type { AppEnv, Env } from '../types'
 import { uploadToR2, parseFileUpload } from '../utils/r2'
+import { sendApnsToUsers, type ApnsPayload } from '../utils/apns'
 
 const chat = new Hono<AppEnv>()
 chat.use('*', requireAuth)
@@ -46,6 +47,72 @@ async function ensureMember(db: D1Database, convId: string | number, userId: str
     .bind(convId, userId)
     .first()
   return !!row
+}
+
+// ── Push-Trigger ────────────────────────────────────────────────────────────
+//   Nach jedem Message-Insert wird APNS an alle anderen Conversation-Mitglieder
+//   getriggert (außer dem Sender). Läuft via ctx.waitUntil — verzögert die
+//   API-Response NICHT, sodass die UI sofort scharf bleibt.
+async function pushNewMessage(
+  env:        Env,
+  convId:     number | string,
+  senderId:   string,
+  senderName: string,
+  bodyText:   string,
+  attachmentName: string | null,
+  conversationTitle: string,
+  conversationType: string,
+): Promise<void> {
+  // Nicht versenden wenn APNS nicht konfiguriert ist
+  if (!env.APNS_TEAM_ID || !env.APNS_KEY_ID || !env.APNS_PRIVATE_KEY || !env.APNS_BUNDLE_ID) {
+    return
+  }
+
+  // Empfänger sammeln (alle außer dem Sender)
+  const rows = await env.DB.prepare(
+    `SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id != ?`
+  ).bind(convId, senderId).all<{ user_id: string }>()
+  const recipients = (rows.results ?? []).map(r => r.user_id)
+  if (recipients.length === 0) return
+
+  // Body-Text fürs Lockscreen — Attachment-Hint wenn ohne Text
+  const preview = bodyText
+    ? bodyText
+    : (attachmentName ? `📎 ${attachmentName}` : '…')
+
+  // Bei DM: Title = Sender-Name. Bei Group: Title = Gruppen-Name + Sender als Subtitle
+  const isDM = conversationType === 'DirectMessage'
+  const payload: ApnsPayload = {
+    title:    isDM ? senderName : conversationTitle,
+    subtitle: isDM ? undefined  : senderName,
+    body:     preview.slice(0, 240),
+    sound:    'default',
+    threadId: `chat-${convId}`,                  // gruppiert Pushs desselben Threads
+    collapseId: `msg-${convId}`,                 // neuere Pushs überschreiben ältere
+    data: {
+      type:           'chat.message',
+      conversationId: Number(convId),
+      senderId,
+      senderName,
+    },
+  }
+
+  const cfg = {
+    teamId:      env.APNS_TEAM_ID,
+    keyId:       env.APNS_KEY_ID,
+    privateKey:  env.APNS_PRIVATE_KEY,
+    bundleId:    env.APNS_BUNDLE_ID,
+    environment: ((env.APNS_ENVIRONMENT ?? 'production') === 'sandbox' ? 'sandbox' : 'production') as 'production' | 'sandbox',
+  }
+
+  try {
+    const result = await sendApnsToUsers(env.DB, cfg, recipients, payload)
+    if (result.cleaned > 0) {
+      console.log(`[chat push] ${result.sent} sent, ${result.failed} failed, ${result.cleaned} dead tokens removed`)
+    }
+  } catch (e: any) {
+    console.error('[chat push] failed:', e?.message ?? e)
+  }
 }
 
 interface ConvDto {
@@ -499,6 +566,25 @@ chat.post('/:id/messages', async (c) => {
     const row = await db.prepare(`SELECT * FROM messages WHERE id = ?`).bind(newId).first<any>()
     if (!row) return c.json({ error: 'Message nach Insert nicht gefunden.' }, 500)
 
+    // ── Push-Notification an alle anderen Mitglieder (im Hintergrund) ──────
+    const convInfo = await db
+      .prepare(`SELECT title, type FROM conversations WHERE id = ?`)
+      .bind(convId).first<{ title: string; type: string }>()
+    if (convInfo) {
+      c.executionCtx.waitUntil(
+        pushNewMessage(
+          c.env,
+          convId,
+          userId,
+          senderName,
+          text,
+          body.attachmentName ?? null,
+          convInfo.title ?? '',
+          convInfo.type ?? 'DirectMessage',
+        )
+      )
+    }
+
     return c.json({
       id:              row.id,
       conversationId:  row.conversation_id,
@@ -585,6 +671,21 @@ chat.post('/:id/send', async (c) => {
 
     const row = await db.prepare(`SELECT * FROM messages WHERE id = ?`).bind(newId).first<any>()
     if (!row) return c.json({ error: 'Message nach Insert nicht gefunden.' }, 500)
+
+    // Push wie bei /messages
+    const convInfo = await db
+      .prepare(`SELECT title, type FROM conversations WHERE id = ?`)
+      .bind(convId).first<{ title: string; type: string }>()
+    if (convInfo) {
+      c.executionCtx.waitUntil(
+        pushNewMessage(
+          c.env, convId, userId, senderName, text,
+          body.attachmentName ?? null,
+          convInfo.title ?? '',
+          convInfo.type ?? 'DirectMessage',
+        )
+      )
+    }
 
     return c.json({
       id:              row.id,

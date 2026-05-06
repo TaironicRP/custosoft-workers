@@ -15,6 +15,14 @@ export interface Env {
   APPLE_IAP_SHARED_SECRET:  string
   RESEND_API_KEY:           string    // E-Mail-Versand via Resend
 
+  // APNS (Apple Push Notification Service) — alle 4 nötig für Push-Versand.
+  // Wenn auch nur einer fehlt, wird Push silent übersprungen (kein Crash).
+  APNS_TEAM_ID:      string             // 10-Zeichen Team-ID aus Apple Developer
+  APNS_KEY_ID:       string             // 10-Zeichen Key-ID des .p8-Files
+  APNS_PRIVATE_KEY:  string             // PEM-Inhalt der .p8-Datei (mit BEGIN/END-Zeilen)
+  APNS_BUNDLE_ID:    string             // App-Bundle-ID, z.B. com.taironic.custosoft
+  APNS_ENVIRONMENT?: string             // 'production' (default) | 'sandbox'
+
   // Vars (non-secret, in wrangler.toml)
   APP_ENV:         string
   PUBLIC_BASE_URL: string

@@ -34,6 +34,18 @@ FROM_NAME       = "CustoSoft"
 # pages.dev: production webapp + preview deploys (Wildcard via index.ts handler)
 ALLOWED_ORIGINS = "https://custosoft.de,https://www.custosoft.de,https://custosoft-webapp.pages.dev,capacitor://localhost,http://localhost,http://localhost:5173"
 
+# ── APNS Push (non-secret Teile) ────────────────────────────────────────────
+# APNS_PRIVATE_KEY ist ein Secret (über `wrangler secret put` setzen).
+# Diese drei sind nicht sensitiv und können hier stehen.
+APNS_BUNDLE_ID    = "com.taironic.custosoft"
+APNS_ENVIRONMENT  = "production"   # "production" für TestFlight + App Store
+                                   # "sandbox" nur für lokale Xcode-Builds
+# APNS_TEAM_ID und APNS_KEY_ID werden nach dem Anlegen des .p8-Keys gesetzt
+# (entweder hier oder als Secrets — beides funktioniert, hier reicht weil
+# die IDs nicht geheim sind):
+# APNS_TEAM_ID = "ABC1234567"
+# APNS_KEY_ID  = "DEF7654321"
+
 # ── Secrets (set via: wrangler secret put SECRET_NAME) ─────────────────────
 # JWT_SECRET              — 64+ char random string
 # APPLE_CLIENT_ID         — com.taironic.custosoft
