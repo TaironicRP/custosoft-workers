@@ -1035,12 +1035,18 @@ document.addEventListener('change', e => {
 const RM_STATUS = { done: '✓ LIVE', now: '▶ JETZT', next: '→ NÄCHSTES', later: '… GEPLANT' }
 const RM_COLORS = { done: '#3FE07A', now: '#8a44ee', next: '#3a62ff', later: 'rgba(255,255,255,0.4)' }
 
+// Items aus dem letzten loadRoadmap-Call cachen — der Edit-Button referenziert
+// per ID darauf, statt das ganze Objekt via inline-JSON ins onclick zu inlinen
+// (das ist im TS-Template-Literal eine Escape-Hölle und war bereits kaputt).
+let _rmCache = []
+
 async function loadRoadmap() {
   const list = document.getElementById('roadmapList')
   list.innerHTML = '<div class="loading">Lade…</div>'
   try {
     const r = await api('/admin/roadmap')
     const items = r.items || []
+    _rmCache = items
     if (!items.length) {
       list.innerHTML = '<div class="muted" style="text-align:center;padding:30px">Keine Einträge — leg den ersten an.</div>'
       return
@@ -1058,7 +1064,7 @@ async function loadRoadmap() {
         + '    <div style="font-size:14px;font-weight:600">' + esc(i.title) + '</div>'
         + '    <div class="muted" style="font-size:12px;margin-top:2px">' + esc(i.description || '') + '</div>'
         + '  </div>'
-        + '  <button class="btn" onclick=\'openRoadmapEdit(' + JSON.stringify(i).replace(/\'/g, '&#39;') + ')\'>Bearbeiten</button>'
+        + '  <button class="btn" onclick="openRoadmapEdit(' + i.id + ')">Bearbeiten</button>'
         + '  <button class="btn err" onclick="deleteRoadmap(' + i.id + ')">Löschen</button>'
         + '</div>'
     }).join('')
@@ -1067,7 +1073,14 @@ async function loadRoadmap() {
   }
 }
 
-function openRoadmapEdit(item) {
+function openRoadmapEdit(idOrItem) {
+  // Akzeptiert: undefined (=neu), Number/String-ID (Cache-Lookup), oder Item direkt
+  let item = null
+  if (typeof idOrItem === 'number' || typeof idOrItem === 'string') {
+    item = _rmCache.find(x => String(x.id) === String(idOrItem)) || null
+  } else if (idOrItem && typeof idOrItem === 'object') {
+    item = idOrItem
+  }
   const isNew = !item
   const i = item || { quarter: '', title: '', description: '', status: 'later', sort_order: 100, is_public: 1 }
   const wrap = document.getElementById('genericModal') || (() => {
@@ -1083,7 +1096,7 @@ function openRoadmapEdit(item) {
     + '    <div><label class="lbl">Titel</label><input id="rmTitle" type="text" value="' + escAttr(i.title) + '" placeholder="Feature-Name"></div>'
     + '  </div>'
     + '  <label class="lbl">Beschreibung</label>'
-    + '  <textarea id="rmDescription" rows="3" placeholder="Worum geht\'s …">' + esc(i.description || '') + '</textarea>'
+    + '  <textarea id="rmDescription" rows="3" placeholder="Worum geht es …">' + esc(i.description || '') + '</textarea>'
     + '  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px">'
     + '    <div><label class="lbl">Status</label>'
     + '      <select id="rmStatus">'
@@ -1135,12 +1148,15 @@ async function deleteRoadmap(id) {
 // ════════════════════════════════════════════════════════════════════════
 // PATCH-NOTES
 // ════════════════════════════════════════════════════════════════════════
+let _pnCache = []   // s. _rmCache-Begründung
+
 async function loadPatchNotes() {
   const list = document.getElementById('patchNotesList')
   list.innerHTML = '<div class="loading">Lade…</div>'
   try {
     const r = await api('/admin/patch-notes')
     const items = r.items || []
+    _pnCache = items
     if (!items.length) {
       list.innerHTML = '<div class="muted" style="text-align:center;padding:30px">Noch keine Patch-Notes.</div>'
       return
@@ -1157,7 +1173,7 @@ async function loadPatchNotes() {
         + '    <span class="muted" style="font-size:11px;background:rgba(255,255,255,0.06);padding:2px 6px;border-radius:3px">' + esc(p.platform) + '</span>'
         + '    ' + visBadge
         + '    <span style="margin-left:auto"></span>'
-        + '    <button class="btn" onclick=\'openPatchNoteEdit(' + JSON.stringify(p).replace(/\'/g, '&#39;') + ')\'>Bearbeiten</button>'
+        + '    <button class="btn" onclick="openPatchNoteEdit(' + p.id + ')">Bearbeiten</button>'
         + '    <button class="btn err" onclick="deletePatchNote(' + p.id + ')">Löschen</button>'
         + '  </div>'
         + (p.title ? '<div style="font-weight:600;font-size:14px">' + esc(p.title) + '</div>' : '')
@@ -1171,7 +1187,13 @@ async function loadPatchNotes() {
   }
 }
 
-function openPatchNoteEdit(note) {
+function openPatchNoteEdit(idOrNote) {
+  let note = null
+  if (typeof idOrNote === 'number' || typeof idOrNote === 'string') {
+    note = _pnCache.find(x => String(x.id) === String(idOrNote)) || null
+  } else if (idOrNote && typeof idOrNote === 'object') {
+    note = idOrNote
+  }
   const isNew = !note
   const n = note || { version: '', title: '', body_html: '', platform: 'all', released_at: new Date().toISOString().slice(0,10), is_published: 1, sort_order: 100 }
   const wrap = document.getElementById('genericModal') || (() => {
