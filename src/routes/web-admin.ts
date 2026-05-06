@@ -981,8 +981,8 @@ async function openBugDetail(id) {
       + (att.length ? '<label class="lbl">Anhänge (' + att.length + ')</label>'
           + '<div style="display:flex;flex-direction:column;gap:6px;margin:6px 0 14px">'
           + att.map(a => {
-              const isImg = /^image\//.test(a.type || '')
-              const isVid = /^video\//.test(a.type || '')
+              const isImg = (a.type || '').indexOf('image/') === 0
+              const isVid = (a.type || '').indexOf('video/') === 0
               const url = a.url.startsWith('http') ? a.url : 'https://custosoft-api.davidschroedinger.workers.dev' + a.url
               if (isImg) return '<div style="display:flex;align-items:center;gap:10px"><img src="' + esc(url) + '" style="max-width:120px;max-height:80px;border-radius:6px;object-fit:cover"><a href="' + esc(url) + '" target="_blank" style="color:#6abef8">' + esc(a.name) + '</a><span class="muted" style="font-size:11px">' + (a.bytes/1024).toFixed(0) + ' KB</span></div>'
               if (isVid) return '<div><video controls src="' + esc(url) + '" style="max-width:240px;max-height:160px;border-radius:6px"></video><br><a href="' + esc(url) + '" target="_blank" style="color:#6abef8">' + esc(a.name) + '</a></div>'
