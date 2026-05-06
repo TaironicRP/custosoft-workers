@@ -416,6 +416,24 @@ auth.put('/me', requireAuth, async (c) => {
   return c.json(await buildUserDto(c.env.DB, u))
 })
 
+// ── PUT /me/name — Vor- + Nachname ändern ─────────────────────────────────────
+auth.put('/me/name', requireAuth, async (c) => {
+  const userId = c.get('userId') as string
+  const { firstName, lastName } = await c.req.json<{ firstName?: string; lastName?: string }>()
+                                          .catch(() => ({}))
+  const fn = (firstName ?? '').trim()
+  const ln = (lastName  ?? '').trim()
+  if (fn.length > 60 || ln.length > 60)
+    return c.json({ error: 'Name zu lang (max. 60 Zeichen).' }, 400)
+
+  await c.env.DB
+    .prepare('UPDATE users SET first_name = ?, last_name = ? WHERE id = ?')
+    .bind(fn || null, ln || null, userId).run()
+
+  const u = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first<any>()
+  return c.json(await buildUserDto(c.env.DB, u))
+})
+
 // ── PUT /me/username ──────────────────────────────────────────────────────────
 auth.put('/me/username', requireAuth, async (c) => {
   const { username } = await c.req.json<{ username: string }>()
