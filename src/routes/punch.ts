@@ -824,16 +824,23 @@ punch.get('/team/:userId', async (c) => {
   const to = c.req.query('to')
 
   const orgMember = await db
-    .prepare(`SELECT org_id, role FROM org_members
+    .prepare(`SELECT org_id, role, can_view_salaries, can_manage_employee_profiles
+              FROM org_members
               WHERE user_id = ? AND is_active = 1 LIMIT 1`)
     .bind(user.id)
-    .first<{ org_id: number; role: string }>()
+    .first<{ org_id: number; role: string; can_view_salaries: number; can_manage_employee_profiles: number }>()
 
   if (!orgMember) {
     return c.json({ error: 'Not in an organisation' }, 403)
   }
 
-  const canView = ['Owner', 'Admin'].includes(orgMember.role)
+  // Owner / Admin / can_view_salaries / can_manage_employee_profiles dürfen
+  // fremde Records einsehen — Letztere brauchen sie für nachträgliche
+  // Lohn-Korrekturen.
+  const canView = orgMember.role === 'Owner' ||
+                  orgMember.role === 'Admin' ||
+                  orgMember.can_view_salaries === 1 ||
+                  orgMember.can_manage_employee_profiles === 1
   if (!canView) {
     return c.json({ error: 'Insufficient permissions' }, 403)
   }
