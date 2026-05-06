@@ -31,11 +31,22 @@ import { runSubscriptionLifecycle } from './cron/subscriptionLifecycle'
 const app = new Hono<{ Bindings: Env }>()
 
 // ── CORS — allow all origins in dev, specific origins in prod ─────────────────
+//   Match-Logik:
+//   1. Exakter Match in ALLOWED_ORIGINS (custosoft.de, pages.dev-Production-URL, …)
+//   2. Wildcard-Match auf *.custosoft-webapp.pages.dev (Preview-Deploys mit Hash-Subdomain)
+//   3. http://localhost:* (Dev mit beliebigem Vite-Port)
+//   Sonst → erster Origin aus der Liste als Default (verhindert „null"-Reflektion).
 app.use('*', async (c, next) => {
   const allowedOrigins = (c.env.ALLOWED_ORIGINS ?? '').split(',').map(s => s.trim())
 
   return cors({
-    origin: (o) => allowedOrigins.includes(o) || o === '' ? o : allowedOrigins[0],
+    origin: (o) => {
+      if (!o) return o                               // same-origin / curl ohne Origin
+      if (allowedOrigins.includes(o)) return o
+      if (/^https:\/\/[a-z0-9-]+\.custosoft-webapp\.pages\.dev$/.test(o)) return o
+      if (/^http:\/\/localhost(:\d+)?$/.test(o))     return o
+      return allowedOrigins[0]
+    },
     allowMethods:  ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowHeaders:  ['Content-Type', 'Authorization', 'Accept'],
     exposeHeaders: ['Content-Length'],

@@ -31,7 +31,8 @@ PUBLIC_BASE_URL = "https://api.custosoft.de"
 FROM_EMAIL      = "noreply@custosoftcustomers.com"
 FROM_NAME       = "CustoSoft"
 # CORS: allow requests from the app (and web if needed)
-ALLOWED_ORIGINS = "https://custosoft.de,capacitor://localhost,http://localhost"
+# pages.dev: production webapp + preview deploys (Wildcard via index.ts handler)
+ALLOWED_ORIGINS = "https://custosoft.de,https://www.custosoft.de,https://custosoft-webapp.pages.dev,capacitor://localhost,http://localhost,http://localhost:5173"
 
 # ── Secrets (set via: wrangler secret put SECRET_NAME) ─────────────────────
 # JWT_SECRET              — 64+ char random string

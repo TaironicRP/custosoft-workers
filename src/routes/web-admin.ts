@@ -128,6 +128,36 @@ const ADMIN_HTML = `<!DOCTYPE html>
         <div class="field"><label>Passwort</label><input type="password" id="password" autocomplete="current-password" required></div>
         <button type="submit" class="btn-primary" id="loginBtn">Anmelden</button>
         <div id="loginErr" class="err" style="display:none"></div>
+        <div style="margin-top:14px;text-align:center;font-size:12px">
+          <a href="#" id="forgotLink" style="color:rgba(255,255,255,0.45);text-decoration:none">Passwort vergessen?</a>
+        </div>
+      </form>
+
+      <!-- Passwort-Reset-Form (initial versteckt) -->
+      <form id="forgotForm" style="display:none">
+        <p style="font-size:13px;color:rgba(255,255,255,0.55);margin-bottom:14px">
+          Wir schicken dir einen 6-stelligen Code per E-Mail.
+        </p>
+        <div class="field"><label>E-Mail</label><input type="email" id="forgotEmail" required></div>
+        <button type="submit" class="btn-primary" id="forgotBtn">Code senden</button>
+        <div id="forgotMsg" style="display:none;margin-top:10px;font-size:13px"></div>
+        <div style="margin-top:14px;text-align:center;font-size:12px">
+          <a href="#" id="backToLogin" style="color:rgba(255,255,255,0.45);text-decoration:none">← Zurück zur Anmeldung</a>
+        </div>
+      </form>
+
+      <!-- Code-Eingabe + Neues Passwort (nach „Code senden") -->
+      <form id="resetForm" style="display:none">
+        <p style="font-size:13px;color:rgba(255,255,255,0.55);margin-bottom:14px">
+          Gib den Code aus der E-Mail ein und wähle ein neues Passwort.
+        </p>
+        <div class="field"><label>Code (6 Ziffern)</label><input type="text" id="resetCode" maxlength="6" inputmode="numeric" required></div>
+        <div class="field"><label>Neues Passwort (min. 8 Zeichen)</label><input type="password" id="resetNewPw" minlength="8" required></div>
+        <button type="submit" class="btn-primary" id="resetBtn">Passwort setzen</button>
+        <div id="resetMsg" style="display:none;margin-top:10px;font-size:13px"></div>
+        <div style="margin-top:14px;text-align:center;font-size:12px">
+          <a href="#" id="backToLogin2" style="color:rgba(255,255,255,0.45);text-decoration:none">← Zurück zur Anmeldung</a>
+        </div>
       </form>
     </div>
   </div>
@@ -488,6 +518,67 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
   } catch (err) {
     errEl.textContent = err.message; errEl.style.display = 'block'
   } finally { btn.disabled = false; btn.textContent = 'Anmelden' }
+})
+
+// Toggle zwischen Login / Forgot / Reset
+function showForm(which) {
+  ['loginForm','forgotForm','resetForm'].forEach(id => {
+    const el = document.getElementById(id)
+    if (el) el.style.display = id === which ? '' : 'none'
+  })
+}
+document.getElementById('forgotLink').addEventListener('click', e => {
+  e.preventDefault()
+  document.getElementById('forgotEmail').value = document.getElementById('email').value
+  showForm('forgotForm')
+})
+document.getElementById('backToLogin').addEventListener('click', e => { e.preventDefault(); showForm('loginForm') })
+document.getElementById('backToLogin2').addEventListener('click', e => { e.preventDefault(); showForm('loginForm') })
+
+// Passwort-vergessen Code anfordern
+document.getElementById('forgotForm').addEventListener('submit', async (e) => {
+  e.preventDefault()
+  const btn = document.getElementById('forgotBtn')
+  const msg = document.getElementById('forgotMsg')
+  const email = document.getElementById('forgotEmail').value.trim()
+  msg.style.display = 'none'
+  btn.disabled = true; btn.textContent = '…'
+  try {
+    await api('/auth/forgot', { method: 'POST', body: JSON.stringify({ email }) })
+    msg.textContent = '✓ Falls die E-Mail registriert ist, kommt gleich ein Code an.'
+    msg.style.color = 'rgba(102,221,140,0.9)'
+    msg.style.display = 'block'
+    setTimeout(() => showForm('resetForm'), 1200)
+  } catch (err) {
+    msg.textContent = err.message
+    msg.style.color = 'rgba(255,107,92,0.9)'
+    msg.style.display = 'block'
+  } finally { btn.disabled = false; btn.textContent = 'Code senden' }
+})
+
+// Code + neues Passwort einsenden
+document.getElementById('resetForm').addEventListener('submit', async (e) => {
+  e.preventDefault()
+  const btn = document.getElementById('resetBtn')
+  const msg = document.getElementById('resetMsg')
+  const code = document.getElementById('resetCode').value.trim()
+  const newPassword = document.getElementById('resetNewPw').value
+  msg.style.display = 'none'
+  btn.disabled = true; btn.textContent = '…'
+  try {
+    await api('/auth/reset', { method: 'POST', body: JSON.stringify({ token: code, newPassword }) })
+    msg.textContent = '✓ Passwort gesetzt. Du kannst dich jetzt anmelden.'
+    msg.style.color = 'rgba(102,221,140,0.9)'
+    msg.style.display = 'block'
+    setTimeout(() => {
+      document.getElementById('password').value = newPassword
+      showForm('loginForm')
+    }, 1500)
+  } catch (err) {
+    msg.textContent = err.message
+    msg.style.color = 'rgba(255,107,92,0.9)'
+    msg.style.display = 'block'
+  } finally { btn.disabled = false; btn.textContent = 'Passwort setzen' }
 })
 
 document.getElementById('logoutBtn').addEventListener('click', () => {
