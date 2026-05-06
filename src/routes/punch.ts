@@ -410,30 +410,173 @@ punch.get('/records', async (c) => {
 })
 
 // PUT /punch/records/:id
+//
+// Body: { clockIn?, clockOut?, pauseSeconds?, note? } — alle vier optional.
+//
+// Berechtigungen:
+//   - Solo-User (nicht in einer Org): darf seine EIGENEN Records frei
+//     bearbeiten. Fremde Records sieht er gar nicht.
+//   - In einer Org:
+//     · Owner / Admin / can_manage_employee_profiles dürfen ALLE Records
+//       (eigene + fremde) bearbeiten — Voraussetzung: das Target ist im
+//       gleichen Org-Slot.
+//     · Org-Mitglied OHNE eine dieser Permissions darf NICHTS bearbeiten,
+//       auch nicht die eigenen Records — Lohn-relevante Daten sind tabu.
 punch.put('/records/:id', async (c) => {
-  const user = c.get('user')
-  const db = c.env.DB
-  const id = c.req.param('id')
-  const body = await c.req.json<{ note?: string }>()
+  try {
+    const user = c.get('user')
+    const db = c.env.DB
+    const id = c.req.param('id')
 
-  const record = await db
-    .prepare(`SELECT * FROM punch_entries WHERE id = ? AND user_id = ?`)
-    .bind(id, user.id)
-    .first<any>()
+    const body = await c.req.json<{
+      clockIn?:      string
+      clockOut?:     string | null
+      pauseSeconds?: number
+      note?:         string | null
+    }>().catch(() => ({}))
 
-  if (!record) {
-    return c.json({ error: 'Record not found' }, 404)
+    // Record holen ohne user_id-Filter — den Permission-Check machen wir gleich.
+    const record = await db
+      .prepare(`SELECT * FROM punch_entries WHERE id = ?`)
+      .bind(id).first<any>()
+    if (!record) return c.json({ error: 'Record nicht gefunden.' }, 404)
+
+    // Permission-Check
+    const myMembership = await db.prepare(
+      `SELECT org_id, role, can_manage_employee_profiles
+       FROM org_members WHERE user_id = ? AND is_active = 1 LIMIT 1`
+    ).bind(user.id).first<{ org_id: number; role: string; can_manage_employee_profiles: number }>()
+
+    const isOwn = record.user_id === user.id
+    let allowed = false
+
+    if (!myMembership) {
+      // Solo-User: darf nur eigene Records (fremde sieht er nicht)
+      allowed = isOwn
+    } else {
+      const hasManagerPermission =
+        myMembership.role === 'Owner' ||
+        myMembership.role === 'Admin' ||
+        myMembership.can_manage_employee_profiles === 1
+
+      if (!hasManagerPermission) {
+        // Mitglied ohne Edit-Recht — keine Bearbeitung, auch nicht eigene
+        allowed = false
+      } else {
+        // Manager: prüfen dass Target in derselben Org ist
+        const targetMember = await db.prepare(
+          `SELECT 1 FROM org_members WHERE user_id = ? AND org_id = ? AND is_active = 1`
+        ).bind(record.user_id, myMembership.org_id).first()
+        // Auch wenn der Target seine Org schon verlassen hat: wenn er Records aus
+        // genau dieser Org hat, soll der Manager noch nachträglich korrigieren
+        // dürfen (Lohnabschluss). Daher zusätzlich: gleiche org_id im record.
+        const sameOrg = !!targetMember || record.org_id === myMembership.org_id
+        allowed = sameOrg
+      }
+    }
+
+    if (!allowed) {
+      return c.json({
+        error: 'Keine Berechtigung. Stempelzeiten in einer Organisation können nur Owner, Admins oder Mitglieder mit „Mitarbeiterprofile verwalten"-Recht bearbeiten.'
+      }, 403)
+    }
+
+    // ── Updates zusammenbauen ─────────────────────────────────────────────
+    const sets: string[] = []
+    const binds: any[] = []
+
+    if (body.clockIn !== undefined) {
+      // Format-Check: ISO 8601, sonst lehnen wir ab
+      if (!isValidIso(body.clockIn)) return c.json({ error: 'clockIn muss ISO-8601 sein.' }, 400)
+      sets.push('clock_in = ?'); binds.push(body.clockIn)
+    }
+    if (body.clockOut !== undefined) {
+      if (body.clockOut !== null && !isValidIso(body.clockOut)) {
+        return c.json({ error: 'clockOut muss ISO-8601 sein.' }, 400)
+      }
+      sets.push('clock_out = ?'); binds.push(body.clockOut)
+    }
+    if (body.pauseSeconds !== undefined) {
+      const ps = Number(body.pauseSeconds)
+      if (!Number.isFinite(ps) || ps < 0) return c.json({ error: 'pauseSeconds muss ≥ 0 sein.' }, 400)
+      sets.push('pause_seconds = ?'); binds.push(Math.floor(ps))
+    }
+    if (body.note !== undefined) {
+      sets.push('note = ?'); binds.push(body.note ?? null)
+    }
+    // is_manual = 1 markieren wenn ein Manager-Edit (anderer User) ODER Zeit-Felder
+    // angefasst wurden — damit die Lohnabrechnung diese Records markieren kann.
+    const touchedTime = body.clockIn !== undefined || body.clockOut !== undefined || body.pauseSeconds !== undefined
+    const isManagerEdit = !isOwn
+    if (touchedTime || isManagerEdit) {
+      sets.push('is_manual = 1')
+    }
+
+    if (sets.length === 0) {
+      // Nichts zu tun — return aktuellen Stand
+      return c.json(buildPunchRecord(record))
+    }
+
+    binds.push(id)
+    await db.prepare(`UPDATE punch_entries SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run()
+
+    // Konsistenz-Check: clockOut muss > clockIn sein wenn beide gesetzt
+    const updated = await db.prepare(`SELECT * FROM punch_entries WHERE id = ?`).bind(id).first<any>()
+    if (updated?.clock_out && updated.clock_in && new Date(updated.clock_out) < new Date(updated.clock_in)) {
+      return c.json({ error: 'clockOut darf nicht vor clockIn liegen.' }, 400)
+    }
+
+    // ── Audit-Log: pro tatsächlich geändertem Feld eine Zeile ─────────────
+    try {
+      const editorRow = await db.prepare(
+        `SELECT first_name, last_name, email FROM users WHERE id = ?`
+      ).bind(user.id).first<{ first_name: string | null; last_name: string | null; email: string }>()
+      const editorName = (`${editorRow?.first_name ?? ''} ${editorRow?.last_name ?? ''}`.trim()) || editorRow?.email || null
+
+      const targetRow = isOwn ? editorRow : await db.prepare(
+        `SELECT first_name, last_name, email FROM users WHERE id = ?`
+      ).bind(record.user_id).first<{ first_name: string | null; last_name: string | null; email: string }>()
+      const targetName = (`${targetRow?.first_name ?? ''} ${targetRow?.last_name ?? ''}`.trim()) || targetRow?.email || null
+
+      const auditRows: Array<[string, string | null, string | null]> = []
+      const cmp = (field: string, oldV: any, newV: any) => {
+        const o = oldV == null ? null : String(oldV)
+        const n = newV == null ? null : String(newV)
+        if (o !== n) auditRows.push([field, o, n])
+      }
+      if (body.clockIn !== undefined)      cmp('clock_in',      record.clock_in,      updated?.clock_in)
+      if (body.clockOut !== undefined)     cmp('clock_out',     record.clock_out,     updated?.clock_out)
+      if (body.pauseSeconds !== undefined) cmp('pause_seconds', record.pause_seconds, updated?.pause_seconds)
+      if (body.note !== undefined)         cmp('note',          record.note,          updated?.note)
+
+      if (auditRows.length > 0) {
+        const stmt = db.prepare(
+          `INSERT INTO punch_record_audit
+             (record_id, editor_user_id, editor_name, target_user_id, target_name, org_id, field, old_value, new_value)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        const batch = auditRows.map(([field, oldV, newV]) =>
+          stmt.bind(Number(id), user.id, editorName, record.user_id, targetName, record.org_id ?? null, field, oldV, newV)
+        )
+        await db.batch(batch)
+      }
+    } catch (e: any) {
+      // Audit-Fehler darf den Update nicht blockieren — nur loggen
+      console.warn('[PUT /punch/records/:id] audit write failed:', e?.message ?? e)
+    }
+
+    return c.json(buildPunchRecord(updated))
+  } catch (e: any) {
+    console.error('[PUT /punch/records/:id]', e?.message ?? e, e?.stack)
+    return c.json({ error: `Update fehlgeschlagen: ${e?.message ?? 'unbekannt'}` }, 500)
   }
-
-  await db
-    .prepare(`UPDATE punch_entries SET note = ? WHERE id = ?`)
-    .bind(body.note ?? null, id)
-    .run()
-
-  const updated = await db.prepare(`SELECT * FROM punch_entries WHERE id = ?`).bind(id).first<any>()
-
-  return c.json(buildPunchRecord(updated))
 })
+
+function isValidIso(s: string): boolean {
+  if (typeof s !== 'string') return false
+  const d = new Date(s)
+  return !isNaN(d.getTime())
+}
 
 // DELETE /punch/records/:id
 punch.delete('/records/:id', async (c) => {
@@ -939,6 +1082,86 @@ punch.get('/team/archives/:id', async (c) => {
     entries: (entries.results ?? []).map(buildArchiveEntryDto),
   })
 })
+
+// ════════════════════════════════════════════════════════════════════════════
+//  AUDIT-LOG — Zeitanpassungen nachvollziehen (wer, bei wem, was, wann)
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /punch/records/:id/audit — Audit-Log eines bestimmten Records
+//   Sichtbar wenn:
+//   - Record dem User gehört, ODER
+//   - User ist Owner/Admin/can_view_salaries der Org des Records
+punch.get('/records/:id/audit', async (c) => {
+  const user = c.get('user')
+  const recordId = c.req.param('id')
+
+  const record = await c.env.DB.prepare(
+    `SELECT user_id, org_id FROM punch_entries WHERE id = ?`
+  ).bind(recordId).first<{ user_id: string; org_id: number | null }>()
+  if (!record) {
+    // Record kann inzwischen weg sein — vielleicht in Archiv. Wir prüfen
+    // ob's einen archive_entry mit gleicher id gibt — wenn ja: Audit
+    // sollte trotzdem zugänglich sein.
+    const fromArchive = await c.env.DB.prepare(
+      `SELECT user_id, org_id FROM punch_archive_entries WHERE id = ?`
+    ).bind(recordId).first<{ user_id: string; org_id: number | null }>()
+    if (!fromArchive) return c.json({ error: 'Record nicht gefunden.' }, 404)
+  }
+  const ownerUserId = record?.user_id
+  const recordOrgId = record?.org_id
+
+  let allowed = ownerUserId === user.id
+  if (!allowed && recordOrgId != null) {
+    const me = await c.env.DB.prepare(
+      `SELECT role, can_view_salaries, can_manage_employee_profiles
+       FROM org_members WHERE user_id = ? AND org_id = ? AND is_active = 1`
+    ).bind(user.id, recordOrgId).first<any>()
+    allowed = !!me && (
+      me.role === 'Owner' || me.role === 'Admin' ||
+      me.can_view_salaries === 1 || me.can_manage_employee_profiles === 1
+    )
+  }
+  if (!allowed) return c.json({ error: 'Keine Berechtigung.' }, 403)
+
+  const rows = await c.env.DB.prepare(
+    `SELECT * FROM punch_record_audit WHERE record_id = ? ORDER BY changed_at DESC`
+  ).bind(recordId).all<any>()
+  return c.json({ items: (rows.results ?? []).map(buildAuditDto) })
+})
+
+// GET /punch/team/audit — alle Audit-Einträge der Org (Manager)
+punch.get('/team/audit', async (c) => {
+  const user = c.get('user')
+  const me = await c.env.DB.prepare(
+    `SELECT org_id, role, can_view_salaries FROM org_members
+     WHERE user_id = ? AND is_active = 1 LIMIT 1`
+  ).bind(user.id).first<{ org_id: number; role: string; can_view_salaries: number }>()
+  if (!me) return c.json({ error: 'Nicht in einer Org.' }, 403)
+  const allowed = me.role === 'Owner' || me.role === 'Admin' || me.can_view_salaries === 1
+  if (!allowed) return c.json({ error: 'Keine Berechtigung.' }, 403)
+
+  const limit = Math.min(500, parseInt(c.req.query('limit') ?? '100'))
+  const rows = await c.env.DB.prepare(
+    `SELECT * FROM punch_record_audit WHERE org_id = ? ORDER BY changed_at DESC LIMIT ?`
+  ).bind(me.org_id, limit).all<any>()
+  return c.json({ items: (rows.results ?? []).map(buildAuditDto) })
+})
+
+function buildAuditDto(row: any) {
+  return {
+    id:           row.id,
+    recordId:     row.record_id,
+    editorUserId: row.editor_user_id,
+    editorName:   row.editor_name,
+    targetUserId: row.target_user_id,
+    targetName:   row.target_name,
+    orgId:        row.org_id,
+    field:        row.field,
+    oldValue:     row.old_value,
+    newValue:     row.new_value,
+    changedAt:    row.changed_at,
+  }
+}
 
 function buildArchiveDto(row: any) {
   return {
