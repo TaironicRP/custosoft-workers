@@ -96,6 +96,14 @@ const ADMIN_HTML = `<!DOCTYPE html>
   /* Modal/Drawer */
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(8px); z-index: 100; display: none; align-items: flex-start; justify-content: center; padding: 40px 20px; overflow-y: auto; }
   .modal-backdrop.show { display: flex; }
+  /* Dynamische Modals (Bug-Detail, Roadmap-Editor, Patch-Note-Editor, Email-Template, …)
+     werden zur Laufzeit als <div id="genericModal"> ans body gehängt. Damit sie als
+     Backdrop sichtbar sind, geben wir ihnen hier dieselben Eigenschaften. */
+  #genericModal { position: fixed; inset: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(8px); z-index: 100; align-items: flex-start; justify-content: center; padding: 40px 20px; overflow-y: auto; }
+  #genericModal > .modal-content { background: linear-gradient(180deg, #1a1525 0%, #0a0a14 100%); border: 1px solid rgba(255,255,255,0.10); border-radius: 22px; max-width: 720px; width: 100%; box-shadow: 0 40px 80px rgba(0,0,0,0.6); padding: 0; }
+  #genericModal .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 20px 22px 14px; border-bottom: 1px solid rgba(255,255,255,0.08); margin-bottom: 6px; }
+  #genericModal .modal-head h3 { font-size: 18px; font-weight: 700; }
+  #genericModal .close { background: none; border: none; color: rgba(255,255,255,0.6); font-size: 26px; cursor: pointer; padding: 0 8px; line-height: 1; }
   .modal { background: linear-gradient(180deg, #1a1525 0%, #0a0a14 100%); border: 1px solid rgba(255,255,255,0.10); border-radius: 22px; padding: 28px; max-width: 720px; width: 100%; box-shadow: 0 40px 80px rgba(0,0,0,0.6); }
   .modal-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; padding-bottom: 14px; border-bottom: 1px solid rgba(255,255,255,0.08); }
   .modal-header h3 { font-size: 20px; font-weight: 700; }
