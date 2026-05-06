@@ -32,13 +32,26 @@ function buildProductDto(row: any) {
 
 /** Build UserExtensionRecord DTO matching iOS model */
 function buildExtensionDto(row: any) {
+  // Plattform ableiten:
+  //   - apple_transaction_id != NULL  → via Apple (IAP)
+  //   - environment = 'web' / 'stripe' → via Web (kommt später mit Stripe)
+  //   - sonst (Owner-Direkt-Grant, manuell, …) → null = unbekannt → Frontend
+  //     zeigt das als "Apple" weil unsere App-Käufe historisch alle aus iOS kamen.
+  const apple = row.apple_transaction_id ? 'apple' : null
+  const env   = String(row.environment ?? '').toLowerCase()
+  const platform: 'apple' | 'web' | null =
+    apple ? 'apple' :
+    (env === 'web' || env === 'stripe') ? 'web' :
+    null
+
   return {
     id:          row.id,
     product:     row.product,         // slug enum value
-    grantedVia:  row.granted_via,     // 'Purchase' | 'OrgMembership'
+    grantedVia:  row.granted_via,     // 'Purchase' | 'OrgMembership' (kann von /my überschrieben werden)
     isActive:    (row.is_active ?? 0) === 1,
     purchasedAt: row.purchased_at,
     expiresAt:   row.expires_at,
+    platform,                          // 'apple' | 'web' | null — neue API
   }
 }
 
@@ -75,7 +88,14 @@ products.get('/my', requireAuth, async (c) => {
     .all<any>()
 
   const ownSlugs = new Set<string>(ownRows.results.map((r: any) => r.product))
-  const dtos     = ownRows.results.map(buildExtensionDto)
+  // Eigene Records: grantedVia immer "Purchase" — egal was in der DB steht.
+  // Hintergrund: Org-Owner haben in alten DB-Records oft 'OrgMembership'
+  // markiert, semantisch sind ihre eigenen Käufe aber Purchases — sie sehen
+  // sonst „über Organisation" obwohl sie selbst gezahlt haben.
+  const dtos = ownRows.results.map((r: any) => ({
+    ...buildExtensionDto(r),
+    grantedVia: 'Purchase' as const,
+  }))
 
   // ── Org-geerbte Extensions (vom Inhaber) ──────────────────────────────────
   const membership = await c.env.DB
